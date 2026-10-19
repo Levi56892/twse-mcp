@@ -576,9 +576,9 @@ def _tdcc(method, data=None):
         time.sleep(w)
     _tdcc_last[0] = time.time()
     if method == "GET":
-        r = S.get(TDCC_URL, timeout=45)
+        r = S.get(TDCC_URL, timeout=(10, 30))
     else:
-        r = S.post(TDCC_URL, data=data, timeout=45, headers={"Referer": TDCC_URL})
+        r = S.post(TDCC_URL, data=data, timeout=(10, 30), headers={"Referer": TDCC_URL})
     r.raise_for_status()
     r.encoding = "utf-8"
     return r.text
@@ -616,8 +616,10 @@ def _tdcc_query(code, ymd8):
         rec[f"l{lv}_pct"] = num(cells[4])
         rec["holders"] += rec[f"l{lv}_holders"] or 0
         found += 1
+    if found == 0 and "查無" in html:
+        return None          # 集保確認這週沒有這檔（例如還沒上市）
     if found < 15:
-        return None
+        raise RuntimeError(f"回傳內容不是股權分散表（只讀到 {found} 級），可能是網站忙碌或擋下")
     p = [rec.get(f"l{i}_pct") or 0 for i in range(1, 16)]
     rec["big400_pct"] = round(sum(p[11:15]), 2)
     rec["big1000_pct"] = round(p[14], 2)
@@ -653,12 +655,16 @@ def backfill_holders():
     if not weeks:
         log("集保歷史：查詢頁沒有日期可選，網頁格式可能改了")
         return
-    empty = status.setdefault("holder_empty", {})
+    status.pop("holder_empty", None)   # 舊版可能誤記，丟掉重來
+    empty = status.setdefault("holder_empty2", {})
     watch = _watchlist()
     others = [c for c in sorted(load_json("stocks.json", {})) if STOCK.match(c) and c not in set(watch)]
     plan = [(w, c) for w in weeks for c in watch] + [(w, c) for w in weeks[:OTHER_WEEKS] for c in others]
-    have, done, fails = {}, 0, 0
+    have, done, fails, skipped, last_log = {}, 0, 0, 0, time.time()
     for w, c in plan:
+        if time.time() - last_log > 120:
+            last_log = time.time()
+            log(f"集保歷史：進行中，已補 {done} 筆、沒資料 {skipped} 筆，目前 {c} {w}")
         if time.time() > t_end:
             log(f"集保歷史：本次時間用完，補了 {done} 筆，下次接著補")
             break
@@ -680,6 +686,7 @@ def backfill_holders():
             continue
         if rec is None:
             empty[f"{c}:{w}"] = 1
+            skipped += 1
             continue
         merge_csv(f"holders/{c}.csv", "date", HOLD_COLS, {iso: rec})
         have[c].add(iso)
