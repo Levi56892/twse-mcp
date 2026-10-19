@@ -7,7 +7,9 @@
 回傳格式一律是「列」(list of dict)，讓看板可以直接當表格使用。
 """
 import os
+import re
 import time
+from datetime import datetime, timedelta, timezone
 import requests
 from mcp.server.fastmcp import FastMCP
 
@@ -59,12 +61,36 @@ def _get(d, *names):
     return None
 
 
-CODE_KEYS = ("Code", "SecuritiesCompanyCode", "CompanyCode", "StockCode", "證券代號", "公司代號", "代號")
-NAME_KEYS = ("Name", "CompanyName", "CompanyAbbreviation", "證券名稱", "公司名稱", "名稱")
+def _norm(k):
+    return re.sub(r"[\s\-_()（）/、%．.]", "", str(k)).lower()
+
+
+def _f(d, *cands):
+    """欄位名稱寫法常有 '-'、'_'、括號 的差異；正規化後再比對。"""
+    nd = {_norm(k): v for k, v in d.items()}
+    for c in cands:
+        v = nd.get(_norm(c))
+        if v not in (None, ""):
+            return v
+    return None
+
+
+def _ftok(d, *token_sets):
+    """找第一個『包含所有關鍵字』的欄位，給名稱不確定的來源用。"""
+    for toks in token_sets:
+        for k, v in d.items():
+            nk = _norm(k)
+            if all(_norm(t) in nk for t in toks) and v not in (None, ""):
+                return v
+    return None
+
+
+CODE_KEYS = ("Code", "SecuritiesCompanyCode", "CompanyCode", "StockCode", "證券代號", "公司代號", "股票代號", "代號")
+NAME_KEYS = ("Name", "CompanyName", "CompanyAbbreviation", "證券名稱", "公司名稱", "公司簡稱", "名稱")
 
 
 def _code(d):
-    v = _get(d, *CODE_KEYS)
+    v = _f(d, *CODE_KEYS)
     return str(v).strip() if v is not None else None
 
 
@@ -149,7 +175,7 @@ def get_daily_close(codes: list[str]) -> list[dict]:
     rows = []
     for d in _pick(_fetch_json(TWSE, "/exchangeReport/STOCK_DAY_ALL"), codes):
         rows.append({
-            "ticker": _code(d), "name": _get(d, *NAME_KEYS), "market": "上市", "date": d.get("Date"),
+            "ticker": _code(d), "name": _f(d, *NAME_KEYS), "market": "上市", "date": d.get("Date"),
             "open": _num(d.get("OpeningPrice")), "high": _num(d.get("HighestPrice")),
             "low": _num(d.get("LowestPrice")), "close": _num(d.get("ClosingPrice")),
             "change": _num(d.get("Change")), "volume_shares": _num(d.get("TradeVolume")),
@@ -157,7 +183,7 @@ def get_daily_close(codes: list[str]) -> list[dict]:
         })
     for d in _pick(_fetch_json(TPEX, TPEX_CLOSE), codes):
         rows.append({
-            "ticker": _code(d), "name": _get(d, *NAME_KEYS), "market": "上櫃",
+            "ticker": _code(d), "name": _f(d, *NAME_KEYS), "market": "上櫃",
             "date": _get(d, "Date", "資料日期"),
             "open": _num(_get(d, "Open", "OpeningPrice", "開盤")),
             "high": _num(_get(d, "High", "Highest", "HighestPrice", "最高")),
@@ -177,11 +203,11 @@ def get_valuation(codes: list[str]) -> list[dict]:
     回傳：ticker, name, market, date(民國年), pe, dividend_yield_pct, pb。"""
     rows = []
     for d in _pick(_fetch_json(TWSE, "/exchangeReport/BWIBBU_ALL"), codes):
-        rows.append({"ticker": _code(d), "name": _get(d, *NAME_KEYS), "market": "上市", "date": d.get("Date"),
+        rows.append({"ticker": _code(d), "name": _f(d, *NAME_KEYS), "market": "上市", "date": d.get("Date"),
                      "pe": _num(d.get("PEratio")), "dividend_yield_pct": _num(d.get("DividendYield")),
                      "pb": _num(d.get("PBratio"))})
     for d in _pick(_fetch_json(TPEX, TPEX_PE), codes):
-        rows.append({"ticker": _code(d), "name": _get(d, *NAME_KEYS), "market": "上櫃",
+        rows.append({"ticker": _code(d), "name": _f(d, *NAME_KEYS), "market": "上櫃",
                      "date": _get(d, "Date", "資料日期"),
                      "pe": _num(_get(d, "PriceEarningRatio", "PEratio", "PERatio", "本益比")),
                      "dividend_yield_pct": _num(_get(d, "YieldRatio", "DividendYield", "殖利率")),
@@ -200,7 +226,7 @@ def get_emerging_quotes(codes: list[str]) -> list[dict]:
         price = _num(_get(d, "LatestPrice", "LastPrice", "Close", "TransactionPrice", "成交", "最後成交價"))
         prev_avg = _num(_get(d, "PreviousAveragePrice", "PreviousDayAveragePrice", "前日均價"))
         rows.append({
-            "ticker": _code(d), "name": _get(d, *NAME_KEYS), "market": "興櫃",
+            "ticker": _code(d), "name": _f(d, *NAME_KEYS), "market": "興櫃",
             "date": _get(d, "Date", "資料日期"),
             "price": price, "prev_avg": prev_avg,
             "avg": _num(_get(d, "Average", "DailyAveragePrice", "AveragePrice", "日均價")),
@@ -214,18 +240,279 @@ def get_emerging_quotes(codes: list[str]) -> list[dict]:
     return rows
 
 
+# ---------- 三大法人、月營收、財報 ----------
+TW_TZ = timezone(timedelta(hours=8))
+TWSE_REV = ["/opendata/t187ap05_L"]
+TPEX_REV = ["/mopsfin_t187ap05_O"]
+TWSE_EPS = ["/opendata/t187ap14_L"]
+TPEX_EPS = ["/mopsfin_t187ap14_O"]
+IND = ["ci", "basi", "bd", "fh", "ins", "mim"]   # 一般業、銀行、證券期貨、金控、保險、異業
+TWSE_IS = [f"/opendata/t187ap06_L_{x}" for x in IND]
+TPEX_IS = [f"/mopsfin_t187ap06_O_{x}" for x in IND]
+TWSE_BS = [f"/opendata/t187ap07_L_{x}" for x in IND]
+TPEX_BS = [f"/mopsfin_t187ap07_O_{x}" for x in IND]
+TPEX_INST = ["/tpex_3insti_daily_trading"]
+
+
+def _multi(base, paths):
+    """依序抓多個來源合併，抓不到的略過（例如某產業別沒有資料）。"""
+    rows = []
+    for p in paths:
+        key = "fail:" + base + p
+        hit = _cache.get(key)
+        if hit and time.time() - hit[0] < DAILY_TTL:
+            continue   # 最近抓過失敗（例如這個產業別沒有資料），先跳過
+        try:
+            data = _fetch_json(base, p)
+            if isinstance(data, list):
+                rows.extend(data)
+        except Exception:  # noqa: BLE001
+            _cache[key] = (time.time(), None)
+    return rows
+
+
+def _index(rows):
+    out = {}
+    for d in rows:
+        c = _code(d)
+        if c:
+            out[c] = d
+    return out
+
+
+def _lots(x):
+    v = _num(x)
+    return round(v / 1000) if v is not None else None
+
+
+def _twse_t86():
+    """證交所三大法人買賣超（個股），往前找最近一個有資料的交易日。"""
+    def go():
+        day = datetime.now(TW_TZ)
+        for _ in range(10):
+            ds = day.strftime("%Y%m%d")
+            try:
+                r = _session.get("https://www.twse.com.tw/rwd/zh/fund/T86",
+                                 params={"date": ds, "selectType": "ALLBUT0999", "response": "json"}, timeout=30)
+                j = r.json()
+                if j.get("stat") == "OK" and j.get("data"):
+                    f = j["fields"]
+                    return [dict(zip(f, row), _date=ds) for row in j["data"]]
+            except Exception:  # noqa: BLE001
+                pass
+            day -= timedelta(days=1)
+        return []
+    return _cached("t86", DAILY_TTL, go)
+
+
+def _inst_row(d, market):
+    if market == "上市":
+        f1 = _num(_f(d, "外陸資買賣超股數(不含外資自營商)")) or 0
+        f2 = _num(_f(d, "外資自營商買賣超股數")) or 0
+        foreign = f1 + f2
+        trust = _num(_f(d, "投信買賣超股數"))
+        dealer = _num(_f(d, "自營商買賣超股數"))
+        total = _num(_f(d, "三大法人買賣超股數"))
+        date = d.get("_date")
+    else:
+        foreign = _num(_ftok(d, ("外資及陸資", "買賣超"), ("外資", "買賣超"), ("Foreign", "Difference"), ("Foreign", "NetBuy")))
+        trust = _num(_ftok(d, ("投信", "買賣超"), ("InvestmentTrust", "Difference"), ("InvestmentTrust", "NetBuy")))
+        dealer = _num(_ftok(d, ("自營商", "買賣超"), ("Dealers", "Difference"), ("Dealer", "Difference"), ("Dealer", "NetBuy")))
+        total = _num(_ftok(d, ("三大法人", "買賣超"), ("Total", "Difference"), ("Total", "NetBuy")))
+        date = _f(d, "Date", "資料日期")
+    return {"foreign_lots": _lots(foreign), "trust_lots": _lots(trust),
+            "dealer_lots": _lots(dealer), "total_lots": _lots(total), "inst_date": date}
+
+
+@mcp.tool()
+def get_institutional(codes: list[str]) -> list[dict]:
+    """取得三大法人買賣超（最近一個交易日，單位：張），上市與上櫃皆可。
+    回傳：ticker, name, market, inst_date, foreign_lots(外資), trust_lots(投信), dealer_lots(自營商), total_lots(合計)。
+    證交所通常在下午 4 點半後公布當日資料。"""
+    want = _clean_codes(codes)
+    rows = []
+    tw = _index(_twse_t86())
+    tp = _index(_multi(TPEX, TPEX_INST))
+    for c in want:
+        if c in tw:
+            rows.append({"ticker": c, "name": str(_f(tw[c], *NAME_KEYS) or "").strip(), "market": "上市", **_inst_row(tw[c], "上市")})
+        elif c in tp:
+            rows.append({"ticker": c, "name": _f(tp[c], *NAME_KEYS), "market": "上櫃", **_inst_row(tp[c], "上櫃")})
+    return rows
+
+
+def _rev_row(d):
+    return {
+        "industry": _f(d, "產業別"),
+        "rev_month": _f(d, "資料年月"),
+        "revenue_k": _num(_f(d, "營業收入-當月營收")),
+        "rev_mom_pct": _num(_f(d, "營業收入-上月比較增減(%)", "營業收入-上月比較增減")),
+        "rev_yoy_pct": _num(_f(d, "營業收入-去年同月增減(%)", "營業收入-去年同月增減")),
+        "rev_ytd_k": _num(_f(d, "累計營業收入-當月累計營收")),
+        "rev_ytd_yoy_pct": _num(_f(d, "累計營業收入-前期比較增減(%)", "累計營業收入-前期比較增減")),
+    }
+
+
+@mcp.tool()
+def get_monthly_revenue(codes: list[str]) -> list[dict]:
+    """取得最新一個月的月營收（上市、上櫃），金額單位：千元。
+    回傳：ticker, name, market, industry, rev_month(民國年月), revenue_k, rev_mom_pct(月增%), rev_yoy_pct(年增%),
+    rev_ytd_k(累計營收), rev_ytd_yoy_pct(累計年增%)。"""
+    want = _clean_codes(codes)
+    tw, tp = _index(_multi(TWSE, TWSE_REV)), _index(_multi(TPEX, TPEX_REV))
+    rows = []
+    for c in want:
+        for src, mkt in ((tw, "上市"), (tp, "上櫃")):
+            if c in src:
+                rows.append({"ticker": c, "name": _f(src[c], *NAME_KEYS), "market": mkt, **_rev_row(src[c])})
+                break
+    return rows
+
+
+def _is_row(d):
+    return {
+        "fin_year": _f(d, "年度"), "fin_quarter": _f(d, "季別"),
+        "revenue_k": _num(_f(d, "營業收入", "收益", "淨收益", "利息淨收益")),
+        "gross_profit_k": _num(_f(d, "營業毛利(毛損)淨額", "營業毛利(毛損)", "營業毛利")),
+        "operating_income_k": _num(_f(d, "營業利益(損失)", "營業利益")),
+        "pretax_income_k": _num(_f(d, "稅前淨利(淨損)", "繼續營業單位稅前淨利(淨損)", "稅前淨利")),
+        "net_income_k": _num(_f(d, "淨利(淨損)歸屬於母公司業主", "淨利(損)歸屬於母公司業主", "本期淨利(淨損)", "本期稅後淨利(淨損)")),
+        "eps": _num(_f(d, "基本每股盈餘(元)", "基本每股盈餘", "每股盈餘")),
+    }
+
+
+def _bs_row(d):
+    return {
+        "total_assets_k": _num(_f(d, "資產總額", "資產總計")),
+        "total_liabilities_k": _num(_f(d, "負債總額", "負債總計")),
+        "equity_parent_k": _num(_f(d, "歸屬於母公司業主之權益合計", "權益總額", "權益總計")),
+        "book_value_per_share": _num(_f(d, "每股參考淨值")),
+    }
+
+
+@mcp.tool()
+def get_financials(codes: list[str]) -> list[dict]:
+    """取得最新一期季報（財報）重點，上市與上櫃皆可，金額單位：千元。
+    損益數字為『當年度累計』：第 1 季=1-3 月、第 3 季=1-9 月、第 4 季=全年（即年報數字）。
+    回傳：ticker, name, market, fin_year, fin_quarter, revenue_k, gross_profit_k, operating_income_k, pretax_income_k,
+    net_income_k, eps, gross_margin, operating_margin, net_margin, total_assets_k, total_liabilities_k,
+    equity_parent_k, debt_ratio, roe_ytd, book_value_per_share。"""
+    want = _clean_codes(codes)
+    srcs = (("上市", _index(_multi(TWSE, TWSE_IS)), _index(_multi(TWSE, TWSE_BS))),
+            ("上櫃", _index(_multi(TPEX, TPEX_IS)), _index(_multi(TPEX, TPEX_BS))))
+    rows = []
+    for c in want:
+        for mkt, inc, bal in srcs:
+            if c in inc or c in bal:
+                r = {"ticker": c, "name": _f((inc.get(c) or bal.get(c)), *NAME_KEYS), "market": mkt}
+                r.update(_is_row(inc[c]) if c in inc else _is_row({}))
+                r.update(_bs_row(bal[c]) if c in bal else _bs_row({}))
+                rev, gp, op, ni = r["revenue_k"], r["gross_profit_k"], r["operating_income_k"], r["net_income_k"]
+                ta, tl, eq = r["total_assets_k"], r["total_liabilities_k"], r["equity_parent_k"]
+                r["gross_margin"] = round(gp / rev, 4) if (gp is not None and rev) else None
+                r["operating_margin"] = round(op / rev, 4) if (op is not None and rev) else None
+                r["net_margin"] = round(ni / rev, 4) if (ni is not None and rev) else None
+                r["debt_ratio"] = round(tl / ta, 4) if (tl is not None and ta) else None
+                r["roe_ytd"] = round(ni / eq, 4) if (ni is not None and eq) else None
+                rows.append(r)
+                break
+    return rows
+
+
+# ---------- 選股器用：全市場一張表 ----------
+@mcp.tool()
+def get_screener_universe(market: str = "all") -> list[dict]:
+    """選股器用：一次取得全市場上市、上櫃普通股（不含 ETF、權證）的重點指標，一檔一列。
+    market：all、上市、上櫃。
+    回傳：ticker, name, market, industry, close, change_pct, pe, dividend_yield_pct, pb,
+    rev_month, rev_yoy_pct, rev_mom_pct, rev_ytd_yoy_pct, fin_period, eps_ytd,
+    foreign_lots, trust_lots, dealer_lots, total_lots。第一次呼叫要抓很多資料，可能需要一兩分鐘。"""
+    stock = re.compile(r"^[1-9]\d{3}$")
+    out = {}
+
+    def base(c, name, mkt):
+        return out.setdefault(c, {"ticker": c, "name": name, "market": mkt, "industry": None, "close": None,
+                                  "change_pct": None, "pe": None, "dividend_yield_pct": None, "pb": None,
+                                  "rev_month": None, "rev_yoy_pct": None, "rev_mom_pct": None, "rev_ytd_yoy_pct": None,
+                                  "fin_period": None, "eps_ytd": None, "foreign_lots": None, "trust_lots": None,
+                                  "dealer_lots": None, "total_lots": None})
+
+    def px(r, close, chg):
+        r["close"] = close
+        if close is not None and chg is not None and close - chg:
+            r["change_pct"] = round(chg / (close - chg), 5)
+
+    if market in ("all", "上市"):
+        for d in _fetch_json(TWSE, "/exchangeReport/STOCK_DAY_ALL"):
+            c = _code(d)
+            if c and stock.match(c):
+                px(base(c, _f(d, *NAME_KEYS), "上市"), _num(d.get("ClosingPrice")), _num(d.get("Change")))
+    if market in ("all", "上櫃"):
+        for d in _fetch_json(TPEX, TPEX_CLOSE):
+            c = _code(d)
+            if c and stock.match(c):
+                px(base(c, _f(d, *NAME_KEYS), "上櫃"), _num(_f(d, "Close")), _num(_f(d, "Change")))
+
+    for d in _fetch_json(TWSE, "/exchangeReport/BWIBBU_ALL") + _fetch_json(TPEX, TPEX_PE):
+        c = _code(d)
+        if c in out:
+            out[c].update(pe=_num(_f(d, "PEratio", "PriceEarningRatio")),
+                          dividend_yield_pct=_num(_f(d, "DividendYield", "YieldRatio")),
+                          pb=_num(_f(d, "PBratio", "PriceBookRatio")))
+
+    for d in _multi(TWSE, TWSE_REV) + _multi(TPEX, TPEX_REV):
+        c = _code(d)
+        if c in out:
+            rv = _rev_row(d)
+            out[c].update(industry=rv["industry"], rev_month=rv["rev_month"], rev_yoy_pct=rv["rev_yoy_pct"],
+                          rev_mom_pct=rv["rev_mom_pct"], rev_ytd_yoy_pct=rv["rev_ytd_yoy_pct"])
+
+    for d in _multi(TWSE, TWSE_IS) + _multi(TPEX, TPEX_IS):
+        c = _code(d)
+        if c in out:
+            ir = _is_row(d)
+            if ir["eps"] is not None:
+                out[c].update(eps_ytd=ir["eps"], fin_period=f"{ir['fin_year']}Q{ir['fin_quarter']}")
+
+    for d in _twse_t86():
+        c = _code(d)
+        if c in out:
+            out[c].update({k: v for k, v in _inst_row(d, "上市").items() if k != "inst_date"})
+    for d in _multi(TPEX, TPEX_INST):
+        c = _code(d)
+        if c in out:
+            out[c].update({k: v for k, v in _inst_row(d, "上櫃").items() if k != "inst_date"})
+
+    return sorted(out.values(), key=lambda r: r["ticker"])
+
+
 # ---------- 檢查用 ----------
+PEEK = {
+    "tpex_close": (TPEX, TPEX_CLOSE), "tpex_pe": (TPEX, TPEX_PE), "tpex_esb": (TPEX, TPEX_ESB),
+    "twse_rev": (TWSE, TWSE_REV[0]), "tpex_rev": (TPEX, TPEX_REV[0]),
+    "twse_is": (TWSE, TWSE_IS[0]), "tpex_is": (TPEX, TPEX_IS[0]),
+    "twse_bs": (TWSE, TWSE_BS[0]), "tpex_bs": (TPEX, TPEX_BS[0]),
+    "twse_eps": (TWSE, TWSE_EPS[0]), "tpex_eps": (TPEX, TPEX_EPS[0]),
+    "tpex_inst": (TPEX, TPEX_INST[0]),
+}
+
+
 @mcp.tool()
 def peek_source(source: str, code: str = "") -> dict:
-    """檢查用：看某個資料來源的原始欄位。source 填 tpex_close、tpex_pe 或 tpex_esb；
-    code 可指定代號，不填就回第一筆。"""
-    path = {"tpex_close": TPEX_CLOSE, "tpex_pe": TPEX_PE, "tpex_esb": TPEX_ESB}.get(source)
-    if not path:
-        return {"error": "source 只能是 tpex_close、tpex_pe、tpex_esb"}
+    """檢查用：看某個資料來源的原始欄位。
+    source 可填：tpex_close、tpex_pe、tpex_esb、twse_rev、tpex_rev、twse_is、tpex_is、
+    twse_bs、tpex_bs、twse_eps、tpex_eps、tpex_inst、twse_inst。code 可指定代號，不填就回第一筆。"""
     try:
-        data = _fetch_json(TPEX, path)
+        if source == "twse_inst":
+            data = _twse_t86()
+        elif source in PEEK:
+            data = _fetch_json(*PEEK[source])
+        else:
+            return {"error": "未知的 source"}
     except Exception as e:  # noqa: BLE001
         return {"error": f"{type(e).__name__}: {e}"}
+    if not isinstance(data, list):
+        return {"error": "回傳不是列表", "raw": str(data)[:500]}
     row = next((d for d in data if not code or _code(d) == code), data[0] if data else None)
     return {"rows": len(data), "sample": row}
 
