@@ -34,7 +34,8 @@ BUDGET = {"daily": 40, "backfill": 300, "probe": 10}.get(MODE, 60) * 60
 GAP = 2.0
 STOCK = re.compile(r"^[1-9]\d{3}$")
 COLS = ["date", "open", "high", "low", "close", "volume_lots", "foreign_lots", "trust_lots", "dealer_lots",
-        "total_lots", "margin_lots", "short_lots", "sbl_lots", "foreign_hold_lots", "foreign_hold_pct"]
+        "total_lots", "margin_lots", "short_lots", "sbl_lots", "foreign_hold_lots", "foreign_hold_pct",
+        "margin_buy_lots", "margin_sell_lots", "margin_repay_lots"]
 
 S = requests.Session()
 S.headers["User-Agent"] = "Mozilla/5.0 (twse-collector; +github actions)"
@@ -225,7 +226,11 @@ def src_tpex_inst(d):
 def _margin(r):
     m = num(f(r, "融資今日餘額") or f(r, "今日餘額") or ftok(r, ("資", "今日餘額"), ("資", "餘額")))
     s = num(f(r, "融券今日餘額") or f(r, "今日餘額_2") or ftok(r, ("券", "今日餘額"), ("券", "餘額")))
-    return {"margin_lots": m, "short_lots": s}
+    # 融資買進、賣出、現金償還（張）：用來推估融資維持率
+    buy = num(f(r, "融資買進", "資買", "買進"))
+    sell = num(f(r, "融資賣出", "資賣", "賣出"))
+    repay = num(f(r, "現金償還", "現償", "資現償"))
+    return {"margin_lots": m, "short_lots": s, "margin_buy_lots": buy, "margin_sell_lots": sell, "margin_repay_lots": repay}
 
 
 def src_twse_margin(d):
@@ -276,9 +281,9 @@ def src_tpex_qfii(d):
 
 
 SOURCES = {
-    "上市": [("price", src_twse_price), ("inst", src_twse_inst), ("margin", src_twse_margin),
+    "上市": [("price", src_twse_price), ("inst", src_twse_inst), ("margin2", src_twse_margin),
             ("sbl", src_twse_sbl), ("qfii", src_twse_qfii)],
-    "上櫃": [("price", src_tpex_price), ("inst", src_tpex_inst), ("margin", src_tpex_margin),
+    "上櫃": [("price", src_tpex_price), ("inst", src_tpex_inst), ("margin2", src_tpex_margin),
             ("sbl", src_tpex_sbl), ("qfii", src_tpex_qfii)],
 }
 
