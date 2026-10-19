@@ -205,10 +205,20 @@ def src_tpex_inst(d):
             {"type": "Daily", "sect": "EW", "date": slash(d), "response": "json"})
     out = {}
     for c, r in rows_from(j).items():
-        out[c] = {"foreign_lots": lots(ftok(r, ("外資及陸資", "買賣超"), ("外資", "買賣超"))),
-                  "trust_lots": lots(ftok(r, ("投信", "買賣超"))),
-                  "dealer_lots": lots(ftok(r, ("自營商", "買賣超"))),
-                  "total_lots": lots(ftok(r, ("三大法人", "買賣超"), ("合計", "買賣超")))}
+        foreign = ftok(r, ("外資及陸資", "買賣超"), ("外資", "買賣超"))
+        trust = ftok(r, ("投信", "買賣超"))
+        dealer = ftok(r, ("自營商", "買賣超"))
+        total = ftok(r, ("三大法人", "買賣超"), ("合計", "買賣超"), ("合計",))
+        if foreign is None:
+            # 櫃買中心的欄名只寫「買賣超股數」，依欄位順序判斷：
+            # 外資(不含自營商)、外資自營商、外資合計、投信、自營商(自行)、自營商(避險)、自營商合計
+            net = [v for k, v in r.items() if "買賣超" in str(k) and not any(t in str(k) for t in ("合計", "三大法人"))]
+            if len(net) >= 7:
+                foreign, trust, dealer = net[2], net[3], net[6]
+            elif len(net) >= 4:
+                foreign, trust, dealer = net[0], net[1], net[-1]
+        out[c] = {"foreign_lots": lots(foreign), "trust_lots": lots(trust),
+                  "dealer_lots": lots(dealer), "total_lots": lots(total)}
     return out
 
 
@@ -244,8 +254,14 @@ def src_tpex_sbl(d):
 
 
 def _qfii(r):
-    return {"foreign_hold_lots": lots(ftok(r, ("全體外資", "持有股數"), ("外資", "持有股數"), ("外資", "持股數"))),
-            "foreign_hold_pct": num(ftok(r, ("全體外資", "持股比率"), ("外資", "持股比率"), ("外資", "持股比例")))}
+    held = num(ftok(r, ("全體外資", "持有股數"), ("外資", "持有股數"), ("外資", "持股數"), ("持有股數",)))
+    pct = num(ftok(r, ("全體外資", "持股比率"), ("外資", "持股比率"), ("外資", "持股比例"),
+                   ("持股比率",), ("持股比例",), ("持股", "比重")))
+    if pct is None and held is not None:
+        issued = num(ftok(r, ("發行股數",), ("已發行",)))
+        if issued:
+            pct = round(held / issued * 100, 2)
+    return {"foreign_hold_lots": round(held / 1000) if held is not None else None, "foreign_hold_pct": pct}
 
 
 def src_twse_qfii(d):
@@ -609,6 +625,15 @@ def probe():
                     log(f"  {m}:{kind} 共 {len(vals)} 檔；{c} = {vals.get(c)}")
                 except Exception as e:  # noqa: BLE001
                     log(f"  {m}:{kind} 失敗：{e}")
+        for name, url, params in (
+                ("上櫃法人欄位", "https://www.tpex.org.tw/www/zh-tw/insti/dailyTrade",
+                 {"type": "Daily", "sect": "EW", "date": slash(d), "response": "json"}),
+                ("上櫃外資持股欄位", "https://www.tpex.org.tw/www/zh-tw/insti/qfii", {"date": slash(d), "response": "json"})):
+            try:
+                row = rows_from(get("tpex", url, params)).get("6488") or {}
+                log(f"  {name}：{list(row.items())}")
+            except Exception as e:  # noqa: BLE001
+                log(f"  {name} 失敗：{e}")
         return
 
 
