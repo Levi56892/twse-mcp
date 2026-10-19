@@ -206,8 +206,8 @@ def get_emerging_quotes(codes: list[str]) -> list[dict]:
             "avg": _num(_get(d, "Average", "DailyAveragePrice", "AveragePrice", "日均價")),
             "high": _num(_get(d, "Highest", "High", "最高")),
             "low": _num(_get(d, "Lowest", "Low", "最低")),
-            "bid": _num(_get(d, "LatestBidPrice", "BidPrice", "PurchasePrice", "買進價")),
-            "ask": _num(_get(d, "LatestAskPrice", "LatesAskPrice", "AskPrice", "SellingPrice", "賣出價")),
+            "bid": _num(_get(d, "BuyingPrice", "LatestBidPrice", "BidPrice", "PurchasePrice", "買進價")),
+            "ask": _num(_get(d, "SellingPrice", "LatestAskPrice", "LatesAskPrice", "AskPrice", "SellingPrice", "賣出價")),
             "change_vs_prev_avg": round(price / prev_avg - 1, 5) if (price and prev_avg) else None,
             "volume_shares": _num(_get(d, "TransactionVolume", "TradingVolume", "TradingShares", "成交量")),
         })
