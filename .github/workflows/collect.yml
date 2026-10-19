@@ -1,0 +1,68 @@
+name: 收集台股資料
+
+on:
+  schedule:
+    - cron: "30 13 * * 1-5"   # 台灣時間週一到週五 21:30：抓當天資料
+    - cron: "0 */6 * * *"     # 每 6 小時：回補歷史（補完之後會很快結束）
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "daily＝抓最新資料、backfill＝回補歷史、probe＝測試資料來源"
+        default: "probe"
+        type: choice
+        options: [probe, daily, backfill]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: collect-data
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: 取得程式
+        uses: actions/checkout@v4
+        with:
+          path: code
+
+      - name: 取得已存的資料（data 分支）
+        env:
+          REPO_URL: https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+        run: |
+          if git clone --quiet --depth 1 --branch data "$REPO_URL" data; then
+            echo "已載入既有資料"
+          else
+            mkdir -p data && cd data && git init -q -b data && git remote add origin "$REPO_URL"
+            echo "第一次執行，建立新的 data 分支"
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安裝套件
+        run: pip install --quiet requests pandas lxml
+
+      - name: 收集資料
+        env:
+          DATA_DIR: data
+          MODE: ${{ github.event.inputs.mode }}
+          SCHEDULE: ${{ github.event.schedule }}
+        run: python code/collector.py
+
+      - name: 存回 data 分支
+        if: always() && github.event.inputs.mode != 'probe'
+        run: |
+          cd data
+          git config user.name "twse-collector"
+          git config user.email "twse-collector@users.noreply.github.com"
+          # 只保留最新一版（不保留歷史版本），存放空間才不會越來越大
+          git checkout -q --orphan snapshot
+          git add -A
+          git commit -q -m "資料更新 $(date -u +'%Y-%m-%d %H:%M') UTC" || exit 0
+          git push -q -f origin snapshot:data
+          echo "已存檔"
