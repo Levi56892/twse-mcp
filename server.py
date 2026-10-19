@@ -315,10 +315,10 @@ def _inst_row(d, market):
         total = _num(_f(d, "三大法人買賣超股數"))
         date = d.get("_date")
     else:
-        foreign = _num(_ftok(d, ("外資及陸資", "買賣超"), ("外資", "買賣超"), ("Foreign", "Difference"), ("Foreign", "NetBuy")))
-        trust = _num(_ftok(d, ("投信", "買賣超"), ("InvestmentTrust", "Difference"), ("InvestmentTrust", "NetBuy")))
-        dealer = _num(_ftok(d, ("自營商", "買賣超"), ("Dealers", "Difference"), ("Dealer", "Difference"), ("Dealer", "NetBuy")))
-        total = _num(_ftok(d, ("三大法人", "買賣超"), ("Total", "Difference"), ("Total", "NetBuy")))
+        foreign = _num(_f(d, "ForeignInvestorsIncludeMainlandAreaInvestors-Difference", "外資及陸資-買賣超股數"))
+        trust = _num(_f(d, "SecuritiesInvestmentTrustCompanies-Difference", "投信-買賣超股數"))
+        dealer = _num(_f(d, "Dealers-Difference", "自營商-買賣超股數"))
+        total = _num(_f(d, "TotalDifference", "三大法人買賣超股數合計"))
         date = _f(d, "Date", "資料日期")
     return {"foreign_lots": _lots(foreign), "trust_lots": _lots(trust),
             "dealer_lots": _lots(dealer), "total_lots": _lots(total), "inst_date": date}
@@ -371,7 +371,7 @@ def get_monthly_revenue(codes: list[str]) -> list[dict]:
 
 def _is_row(d):
     return {
-        "fin_year": _f(d, "年度"), "fin_quarter": _f(d, "季別"),
+        "fin_year": _f(d, "年度", "Year"), "fin_quarter": _f(d, "季別", "Season"),
         "revenue_k": _num(_f(d, "營業收入", "收益", "淨收益", "利息淨收益")),
         "gross_profit_k": _num(_f(d, "營業毛利(毛損)淨額", "營業毛利(毛損)", "營業毛利")),
         "operating_income_k": _num(_f(d, "營業利益(損失)", "營業利益")),
