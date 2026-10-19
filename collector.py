@@ -562,6 +562,136 @@ def collect_holders():
     log(f"集保：{len(by)} 檔")
 
 
+# ---------- 集保股權分散：歷史週別回補 ----------
+# 集保開放資料（getOD 1-5）只有最新一週；舊的週別要從集保「股權分散表查詢」網頁逐檔、逐週查詢。
+TDCC_URL = "https://www.tdcc.com.tw/portal/zh/smWeb/qryStock"
+HOLD_BUDGET = 100 * 60       # 每次回補最多花在集保上的時間（秒）
+OTHER_WEEKS = 8              # 自選股以外的股票，回補最近幾週
+_tdcc_last = [0.0]
+
+
+def _tdcc(method, data=None):
+    w = _tdcc_last[0] + 1.2 - time.time()
+    if w > 0:
+        time.sleep(w)
+    _tdcc_last[0] = time.time()
+    if method == "GET":
+        r = S.get(TDCC_URL, timeout=45)
+    else:
+        r = S.post(TDCC_URL, data=data, timeout=45, headers={"Referer": TDCC_URL})
+    r.raise_for_status()
+    r.encoding = "utf-8"
+    return r.text
+
+
+def _tdcc_form(html):
+    """取出查詢表單的隱藏欄位與可查詢的日期（新到舊）。"""
+    hidden = dict(re.findall(r'<input[^>]*type="hidden"[^>]*name="([^"]+)"[^>]*value="([^"]*)"', html))
+    for name, val in re.findall(r'<input[^>]*name="([^"]+)"[^>]*type="hidden"[^>]*value="([^"]*)"', html):
+        hidden.setdefault(name, val)
+    sel = re.search(r'<select[^>]*name="scaDate".*?</select>', html, re.S)
+    dates = re.findall(r'value="(\d{8})"', sel.group(0)) if sel else []
+    return hidden, sorted(set(dates), reverse=True)
+
+
+def _tdcc_query(code, ymd8):
+    """查一檔一週，回傳 HOLD_COLS 格式的一列；沒有資料回傳 None。"""
+    html = _tdcc("GET")
+    hidden, dates = _tdcc_form(html)
+    data = dict(hidden)
+    data.update({"method": "submit", "firDate": dates[0] if dates else ymd8, "scaDate": ymd8,
+                 "sqlMethod": "StockNo", "stockNo": code, "stockName": ""})
+    data.setdefault("SYNCHRONIZER_URI", "/portal/zh/smWeb/qryStock")
+    html = _tdcc("POST", data)
+    rec = {"date": f"{ymd8[:4]}-{ymd8[4:6]}-{ymd8[6:]}", "holders": 0}
+    found = 0
+    for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.S):
+        cells = [re.sub(r"<[^>]+>|&nbsp;|\s", "", c) for c in re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)]
+        if len(cells) < 5 or not cells[0].isdigit():
+            continue
+        lv = int(cells[0])
+        if not 1 <= lv <= 15:
+            continue
+        rec[f"l{lv}_holders"] = num(cells[2])
+        rec[f"l{lv}_pct"] = num(cells[4])
+        rec["holders"] += rec[f"l{lv}_holders"] or 0
+        found += 1
+    if found < 15:
+        return None
+    p = [rec.get(f"l{i}_pct") or 0 for i in range(1, 16)]
+    rec["big400_pct"] = round(sum(p[11:15]), 2)
+    rec["big1000_pct"] = round(p[14], 2)
+    rec["retail_pct"] = round(sum(p[:11]), 2)
+    return rec
+
+
+def _holder_dates(code):
+    full = os.path.join(DATA, "holders", f"{code}.csv")
+    if not os.path.exists(full):
+        return set()
+    with open(full, encoding="utf-8") as fh:
+        return {r["date"] for r in csv.DictReader(fh)}
+
+
+def _watchlist():
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "watchlist.txt")
+    try:
+        with open(p, encoding="utf-8") as fh:
+            return [x.strip() for x in fh if STOCK.match(x.strip())]
+    except OSError:
+        return []
+
+
+def backfill_holders():
+    """自選股先補完集保網站上所有週別，其餘股票補最近 OTHER_WEEKS 週；查過的不再查。"""
+    t_end = time.time() + min(HOLD_BUDGET, time_left() - 900)
+    try:
+        _, weeks = _tdcc_form(_tdcc("GET"))
+    except Exception as e:  # noqa: BLE001
+        log(f"集保歷史：打不開查詢頁 {e}")
+        return
+    if not weeks:
+        log("集保歷史：查詢頁沒有日期可選，網頁格式可能改了")
+        return
+    empty = status.setdefault("holder_empty", {})
+    watch = _watchlist()
+    others = [c for c in sorted(load_json("stocks.json", {})) if STOCK.match(c) and c not in set(watch)]
+    plan = [(w, c) for w in weeks for c in watch] + [(w, c) for w in weeks[:OTHER_WEEKS] for c in others]
+    have, done, fails = {}, 0, 0
+    for w, c in plan:
+        if time.time() > t_end:
+            log(f"集保歷史：本次時間用完，補了 {done} 筆，下次接著補")
+            break
+        iso = f"{w[:4]}-{w[4:6]}-{w[6:]}"
+        if c not in have:
+            have[c] = _holder_dates(c)
+        if iso in have[c] or empty.get(f"{c}:{w}"):
+            continue
+        try:
+            rec = _tdcc_query(c, w)
+            fails = 0
+        except Exception as e:  # noqa: BLE001
+            fails += 1
+            log(f"集保歷史 {c} {iso} 失敗：{e}")
+            if fails >= 5:
+                log("集保歷史：連續失敗，先停下")
+                break
+            time.sleep(10)
+            continue
+        if rec is None:
+            empty[f"{c}:{w}"] = 1
+            continue
+        merge_csv(f"holders/{c}.csv", "date", HOLD_COLS, {iso: rec})
+        have[c].add(iso)
+        done += 1
+        if done % 100 == 0:
+            save_json("status.json", status)
+            log(f"集保歷史：已補 {done} 筆（{c} {iso}）")
+    else:
+        log(f"集保歷史：全部補完，本次 {done} 筆")
+    save_json("status.json", status)
+
+
 def backfill_revenue():
     """月營收歷史：公開資訊觀測站的月營收彙總表（盡力而為，抓不到就略過）。"""
     try:
@@ -634,6 +764,13 @@ def probe():
                 log(f"  {name}：{list(row.items())}")
             except Exception as e:  # noqa: BLE001
                 log(f"  {name} 失敗：{e}")
+        try:
+            _, weeks = _tdcc_form(_tdcc("GET"))
+            log(f"  集保歷史可查週別：{weeks[:6]}…（共 {len(weeks)} 週）")
+            if len(weeks) > 1:
+                log(f"  集保歷史 2330 {weeks[1]}：{_tdcc_query('2330', weeks[1])}")
+        except Exception as e:  # noqa: BLE001
+            log(f"  集保歷史 失敗：{e}")
         return
 
 
@@ -657,6 +794,9 @@ def main():
         collect_financials()
         collect_holders()
     else:
+        if not os.path.exists(os.path.join(DATA, "holders")):
+            collect_holders()
+        backfill_holders()
         count = 0
         for d in weekdays_back(today - timedelta(days=1), START):
             if time_left() < 900:
