@@ -1,0 +1,26 @@
+name: 喚醒報價伺服器
+
+# Render 免費方案閒置 15 分鐘會休眠；每 10 分鐘戳一下，讓「台股報價」連接器隨時能用
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: 戳一下伺服器
+        env:
+          RENDER_URL: ${{ vars.RENDER_URL }}
+        run: |
+          if [ -z "$RENDER_URL" ]; then
+            echo "還沒設定 RENDER_URL：到 Settings → Secrets and variables → Actions → Variables 新增"
+            exit 1
+          fi
+          code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 120 "$RENDER_URL/mcp" || echo "000")
+          echo "伺服器回應：$code（任何 3 位數都代表醒著；000 代表連不上）"
+          [ "$code" != "000" ]
