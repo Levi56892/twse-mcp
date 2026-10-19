@@ -55,3 +55,20 @@ gcloud run deploy twse-quotes --source . --region asia-east1 --allow-unauthentic
 - **SSL 錯誤**：證交所 OpenAPI 的憑證偶爾會讓 Python 驗證失敗。如果遇到這種情況，先更新系統的 CA 憑證（`pip install -U certifi`），不要直接關掉驗證。
 - **上櫃股票**：`get_quotes` 已經支援上櫃。盤後的兩個工具目前只有上市資料，櫃買中心的 OpenAPI 之後可以再加。
 - **市值與歷史報酬**：這兩項不在這個連接器裡。市值需要股本資料，7 日與 1 年報酬需要歷史股價，這些可以繼續從 CMoney 匯出。
+
+## 歷史資料庫（GitHub Actions）
+
+`collector.py` 由 GitHub Actions（`.github/workflows/collect.yml`）自動執行，把資料存在本存放空間的 **data 分支**：
+
+| 時間 | 做什麼 |
+|---|---|
+| 週一到週五 21:30（台灣時間） | 抓當天全市場的股價、三大法人、融資融券、借券、外資持股，以及最新月營收、財報、集保股權分散 |
+| 每 6 小時 | 從新到舊回補 2015 年以來的歷史；抓過的日子不再重抓，補完後會很快結束 |
+
+手動執行：存放空間的 **Actions** 分頁 → 「收集台股資料」→ **Run workflow**，可選：
+- `probe`：只測試各資料來源抓不抓得到，不存檔
+- `daily`：馬上抓最新資料
+- `backfill`：馬上開始回補
+
+連接器（server.py）的 `get_stock_history`、`get_revenue_history`、`get_financials_history`、`get_holder_history` 會直接讀 data 分支上的檔案。
+若存放空間不在 `Levi56892/twse-mcp`，請在 Render 的 Environment 設定 `DATA_BASE=https://raw.githubusercontent.com/<帳號>/<存放空間>/data`。

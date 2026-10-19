@@ -6,6 +6,8 @@
   - 盤後資料（上櫃、興櫃）：櫃買中心 OpenAPI  www.tpex.org.tw/openapi
 回傳格式一律是「列」(list of dict)，讓看板可以直接當表格使用。
 """
+import csv
+import io
 import os
 import re
 import time
@@ -30,6 +32,7 @@ MAX_CODES = 50
 _cache: dict = {}
 _session = requests.Session()
 _session.headers.update(UA)
+TW_TZ = timezone(timedelta(hours=8))
 
 
 def _cached(key, ttl, fn):
@@ -241,7 +244,6 @@ def get_emerging_quotes(codes: list[str]) -> list[dict]:
 
 
 # ---------- 三大法人、月營收、財報 ----------
-TW_TZ = timezone(timedelta(hours=8))
 TWSE_REV = ["/opendata/t187ap05_L"]
 TPEX_REV = ["/mopsfin_t187ap05_O"]
 TWSE_EPS = ["/opendata/t187ap14_L"]
@@ -484,6 +486,104 @@ def get_screener_universe(market: str = "all") -> list[dict]:
             out[c].update({k: v for k, v in _inst_row(d, "上櫃").items() if k != "inst_date"})
 
     return sorted(out.values(), key=lambda r: r["ticker"])
+
+
+# ---------- 歷史資料（GitHub data 分支，由 collector.py 每天自動更新） ----------
+DATA_BASE = os.environ.get("DATA_BASE", "https://raw.githubusercontent.com/Levi56892/twse-mcp/data").rstrip("/")
+
+
+def _store_csv(p, ttl):
+    def go():
+        r = _session.get(f"{DATA_BASE}/{p}", timeout=30)
+        if r.status_code == 404:
+            return []
+        r.raise_for_status()
+        rows = []
+        for row in csv.DictReader(io.StringIO(r.content.decode("utf-8"))):
+            rows.append({k: (v if k in ("date", "month", "period") else _num(v)) for k, v in row.items()})
+        return rows
+    return _cached("store:" + p, ttl, go)
+
+
+def _store_json(p, ttl):
+    def go():
+        r = _session.get(f"{DATA_BASE}/{p}", timeout=30)
+        if r.status_code == 404:
+            return {}
+        r.raise_for_status()
+        return r.json()
+    return _cached("store:" + p, ttl, go)
+
+
+def _stock_info(code):
+    info = _store_json("stocks.json", 6 * 3600).get(code) or {}
+    return info.get("name"), info.get("market")
+
+
+@mcp.tool()
+def get_stock_history(code: str, start: str = "", end: str = "") -> list[dict]:
+    """取得個股每日股價與籌碼歷史（2015 年起，每天收盤後自動更新，資料存在 GitHub）。
+    code：股票代號；start、end：YYYY-MM-DD，可不填（不填＝全部）。每個交易日一列：
+    ticker, name, market, date, open, high, low, close, volume_lots(成交張數),
+    foreign_lots, trust_lots, dealer_lots, total_lots(三大法人買賣超，張),
+    margin_lots(融資餘額，張), short_lots(融券餘額，張), short_margin_ratio(券資比),
+    sbl_lots(借券賣出餘額，張), foreign_hold_lots(外資持股，張), foreign_hold_pct(外資持股比率 %)。"""
+    code = _clean_codes([code])[0]
+    name, market = _stock_info(code)
+    this_year = datetime.now(TW_TZ).year
+    y0 = int(start[:4]) if start[:4].isdigit() else 2015
+    y1 = int(end[:4]) if end[:4].isdigit() else this_year
+    rows = []
+    for y in range(max(2015, y0), min(this_year, y1) + 1):
+        rows.extend(_store_csv(f"daily/{code}/{y}.csv", 1800 if y == this_year else 7 * 86400))
+    out = []
+    for r in rows:
+        if (start and r["date"] < start) or (end and r["date"] > end):
+            continue
+        m, s = r.get("margin_lots"), r.get("short_lots")
+        out.append({"ticker": code, "name": name, "market": market, **r,
+                    "short_margin_ratio": round(s / m, 5) if (m and s is not None) else None})
+    out.sort(key=lambda r: r["date"])
+    return out
+
+
+@mcp.tool()
+def get_revenue_history(code: str) -> list[dict]:
+    """取得個股月營收歷史（金額單位：千元），每月一列：ticker, month(YYYY-MM), revenue_k, last_month_k,
+    last_year_k, mom_pct(月增%), yoy_pct(年增%), ytd_k(累計營收), ytd_last_k, ytd_yoy_pct(累計年增%)。"""
+    code = _clean_codes([code])[0]
+    return [{"ticker": code, **r} for r in _store_csv(f"revenue/{code}.csv", 6 * 3600)]
+
+
+@mcp.tool()
+def get_financials_history(code: str) -> list[dict]:
+    """取得個股季報歷史（金額單位：千元；損益為當年度累計，Q4＝全年），每季一列：ticker, period(如 2026Q2),
+    revenue_k, gross_profit_k, operating_income_k, pretax_income_k, net_income_k, eps,
+    total_assets_k, total_liabilities_k, equity_parent_k, book_value_per_share。"""
+    code = _clean_codes([code])[0]
+    return [{"ticker": code, **r} for r in _store_csv(f"financials/{code}.csv", 6 * 3600)]
+
+
+@mcp.tool()
+def get_holder_history(code: str) -> list[dict]:
+    """取得個股集保股權分散歷史（每週一筆），每週一列：ticker, date, holders(總人數),
+    big400_pct(400 張以上 %), big1000_pct(1000 張以上 %), retail_pct(400 張以下 %),
+    l1_pct…l15_pct(各持股分級占比 %)、l1_holders…l15_holders(各分級人數)。
+    分級：1=1-999股、2=1-5張、3=5-10張、4=10-15張、5=15-20張、6=20-30張、7=30-40張、8=40-50張、
+    9=50-100張、10=100-200張、11=200-400張、12=400-600張、13=600-800張、14=800-1000張、15=1000張以上。"""
+    code = _clean_codes([code])[0]
+    return [{"ticker": code, **r} for r in _store_csv(f"holders/{code}.csv", 6 * 3600)]
+
+
+@mcp.tool()
+def get_store_status() -> dict:
+    """查看歷史資料庫的狀態：最後更新時間、還有多少交易日待回補。"""
+    st = _store_json("status.json", 600)
+    days = st.get("days", {})
+    filled = sorted(d for d, v in days.items() if any(x == 1 for x in v.values()))
+    return {"updated_at": st.get("updated_at"), "remaining_days": st.get("remaining_days"),
+            "earliest_day": filled[0] if filled else None, "latest_day": filled[-1] if filled else None,
+            "days_with_data": len(filled)}
 
 
 # ---------- 檢查用 ----------
