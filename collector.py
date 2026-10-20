@@ -571,7 +571,7 @@ def collect_holders():
 # 集保開放資料（getOD 1-5）只有最新一週；舊的週別要從集保「股權分散表查詢」網頁逐檔、逐週查詢。
 TDCC_URL = "https://www.tdcc.com.tw/portal/zh/smWeb/qryStock"
 HOLD_BUDGET = 100 * 60       # 每次回補最多花在集保上的時間（秒）
-OTHER_WEEKS = 8              # 自選股以外的股票，回補最近幾週
+OTHER_WEEKS = 52             # 自選股以外的股票，回補最近幾週（自選股先補完，有空再慢慢補其他）
 _tdcc_last = [0.0]
 
 
