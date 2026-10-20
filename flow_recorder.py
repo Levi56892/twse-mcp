@@ -201,6 +201,8 @@ class Recorder:
         self.nets = [0.0] * len(SECTORS)
         self.inten = [0.0] * len(SECTORS)
         self.st = {}           # code -> dict(v, p, a, b, dir)
+        self.snet = {}         # code -> 個股累計主動買賣淨額（元）
+        self.sinfo = {}        # code -> (名稱, 昨收, 最新價)
         self.hist = []         # [{m, n:[億...]}]
         self.ex = None         # 決定好的 ex_ch 清單
         self.seeded = False
@@ -245,6 +247,8 @@ class Recorder:
             if tmin is not None and (self.last_t is None or tmin > self.last_t):
                 self.last_t = tmin
             n += 1
+            y = num(m.get("y"))
+            self.sinfo[code] = (m.get("n") or code, y, z or (self.sinfo.get(code) or (0, 0, None))[2])
             st = self.st.get(code)
             if st is None:
                 # 第一次看到：若已有成交，用 CLV 估算開啟前的部分
@@ -257,7 +261,9 @@ class Recorder:
                         y = num(m.get("y")) or p
                         clv = (p > y) - (p < y)
                     typ = ((hi or p) + (lo or p) + p) / 3
-                    self.nets[si] += v * 1000 * typ * clv * SEED_K
+                    seed = v * 1000 * typ * clv * SEED_K
+                    self.nets[si] += seed
+                    self.snet[code] = self.snet.get(code, 0.0) + seed
                     if now_min() > START + 1:
                         self.seeded = True
                 self.st[code] = {"v": v, "p": z, "a": a1, "b": b1, "dir": 1}
@@ -277,6 +283,7 @@ class Recorder:
                     d = st["dir"]
                 amt = dv * 1000 * z
                 self.nets[si] += d * amt
+                self.snet[code] = self.snet.get(code, 0.0) + d * amt
                 tick[si] += amt
                 st["dir"] = d
             if v > st["v"]:
@@ -308,6 +315,13 @@ class Recorder:
             "sectors": [{"name": s[0], "g": s[1]} for s in SECTORS],
             "intensity": [round(x / 1e8, 4) for x in self.inten],
             "hist": self.hist,
+            # 個股最新累計：[代號, 名稱, 產業序號, 淨額(億), 漲跌%]
+            "stocks": [
+                [c, self.sinfo[c][0], SEC_OF[c], round(self.snet.get(c, 0.0) / 1e8, 4),
+                 round((self.sinfo[c][2] - self.sinfo[c][1]) / self.sinfo[c][1] * 100, 2)
+                 if self.sinfo[c][1] and self.sinfo[c][2] else None]
+                for c in CODES if c in self.sinfo
+            ],
         }
 
 
