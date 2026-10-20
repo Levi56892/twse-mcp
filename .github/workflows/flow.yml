@@ -23,6 +23,12 @@ jobs:
       - name: 取得程式
         uses: actions/checkout@v4
 
+      - name: 取得歷史成交資料（挑選各產業成交金額前 20 名用）
+        uses: actions/checkout@v4
+        with:
+          ref: data
+          path: databr
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -34,4 +40,5 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           FLOW_DIR: ${{ runner.temp }}/flowout
+          DATA_DIR: databr
         run: python flow_recorder.py
