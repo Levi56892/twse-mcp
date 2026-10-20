@@ -21,7 +21,9 @@ import requests
 
 TW = timezone(timedelta(hours=8))
 MIS = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
-POLL_SEC = 15
+POLL_SEC = 30
+TOP_N = int(os.environ.get("TOP_N", "20"))   # 每個產業取近 20 日成交金額前 N 名
+DATA_DIR = os.environ.get("DATA_DIR", "databr")  # data 分支（含每日成交量）
 PUSH_SEC = 60
 SEED_K = 0.25
 START = 9 * 60          # 09:00
@@ -31,7 +33,7 @@ OUT_DIR = os.environ.get("FLOW_DIR", "flowout")
 REPO = os.environ.get("GITHUB_REPOSITORY", "")
 TOKEN = os.environ.get("GH_TOKEN", "")
 
-# 產業 → 代表股（g：e 電子、t 傳產、f 金融）
+# 備用清單：自動挑選失敗時才用（g：e 電子、t 傳產、f 金融）
 SECTORS = [
     ("半導體", "e", "2330 2454 2303 3711 2379 3034 6415 3443 3661 2344 2408 5347 6488 3105 5483"),
     ("電子零組件", "e", "2308 3037 2327 2383 3044 2368 2059 3533 8046 2313"),
@@ -65,6 +67,10 @@ SECTORS = [
 NAMES = [s[0] for s in SECTORS]
 SEC_OF = {c: i for i, s in enumerate(SECTORS) for c in s[2].split()}
 CODES = list(SEC_OF)
+MARKET = {}   # code -> "tse" / "otc"（自動挑選時填入）
+ELEC = {"半導體", "電子零組件", "電腦及週邊", "光電", "通信網路", "電子通路", "其他電子", "資訊服務"}
+TWSE_API = "https://openapi.twse.com.tw/v1"
+TPEX_API = "https://www.tpex.org.tw/openapi/v1"
 
 session = requests.Session()
 session.headers.update({"User-Agent": "Mozilla/5.0 (twse-flow-recorder)"})
@@ -91,6 +97,81 @@ def first(s):
     return num(str(s).split("_")[0]) if s else None
 
 
+def norm_industry(s):
+    s = str(s or "").strip()
+    special = {"電腦及週邊設備業": "電腦及週邊", "觀光事業": "觀光餐旅", "觀光餐旅業": "觀光餐旅"}
+    if s in special:
+        return special[s]
+    if s.endswith("工業"):
+        return s if s == "化學工業" else s[:-2]
+    if s.endswith("業") and len(s) > 2:
+        return s[:-1]
+    return s or None
+
+
+def avg_turnover(code, days=20):
+    """data 分支的日資料：近 days 個交易日的平均成交金額（元）。"""
+    year = datetime.now(TW).year
+    rows = []
+    for y in (year - 1, year):
+        path = os.path.join(DATA_DIR, "daily", code, f"{y}.csv")
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                rows += f.read().strip().splitlines()[1:]
+    vals = []
+    for line in rows[-days:]:
+        c = line.split(",")
+        try:
+            vals.append(float(c[5]) * 1000 * float(c[4]))   # volume_lots × close
+        except (IndexError, ValueError):
+            pass
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def build_universe():
+    """全部上市櫃普通股依產業分組，每組取近 20 日平均成交金額前 TOP_N 名。失敗就用備用清單。"""
+    global SECTORS, NAMES, SEC_OF, CODES
+    try:
+        ind = {}
+        for base, path in ((TWSE_API, "/opendata/t187ap05_L"), (TPEX_API, "/mopsfin_t187ap05_O")):
+            r = session.get(base + path, timeout=60)
+            r.raise_for_status()
+            for d in r.json():
+                code, name = str(d.get("公司代號", "")).strip(), norm_industry(d.get("產業別"))
+                if len(code) == 4 and code.isdigit() and name:
+                    ind[code] = name
+        market = {}
+        with open(os.path.join(DATA_DIR, "stocks.csv"), encoding="utf-8") as f:
+            for line in f.read().splitlines()[1:]:
+                c = line.split(",")
+                if len(c) >= 3:
+                    market[c[0]] = "otc" if c[2].strip() == "上櫃" else "tse"
+        groups = {}
+        for code, name in ind.items():
+            if code not in market:
+                continue
+            t = avg_turnover(code)
+            if t > 0:
+                groups.setdefault(name, []).append((t, code))
+        if len(groups) < 10:
+            raise RuntimeError(f"產業太少（{len(groups)}）")
+        secs = []
+        for name, lst in groups.items():
+            lst.sort(reverse=True)
+            top = lst[:TOP_N]
+            g = "f" if name.startswith("金融") else ("e" if name in ELEC else "t")
+            secs.append((sum(t for t, _ in top), name, g, " ".join(c for _, c in top)))
+        secs.sort(reverse=True)
+        SECTORS = [(n, g, codes) for _, n, g, codes in secs]
+        NAMES = [s[0] for s in SECTORS]
+        SEC_OF = {c: i for i, s in enumerate(SECTORS) for c in s[2].split()}
+        CODES = list(SEC_OF)
+        MARKET.update({c: market[c] for c in CODES})
+        log(f"自動挑選完成：{len(SECTORS)} 個產業、{len(CODES)} 檔")
+    except Exception as e:  # noqa: BLE001
+        log("自動挑選失敗，改用備用清單：", type(e).__name__, str(e)[:200])
+
+
 def fetch(ex_list):
     """ex_list: ['tse_2330.tw', ...]；回傳有資料的 msgArray。"""
     if not session.cookies:
@@ -111,7 +192,7 @@ def fetch(ex_list):
             except Exception as e:  # noqa: BLE001
                 log("抓取失敗", type(e).__name__, str(e)[:120])
                 time.sleep(3)
-        time.sleep(0.6)
+        time.sleep(1.2)
     return out
 
 
@@ -129,6 +210,10 @@ class Recorder:
         self.open_today = False  # 有沒有看到今天日期的報價
 
     def resolve_markets(self):
+        if MARKET:
+            self.ex = [f"{MARKET[c]}_{c}.tw" for c in CODES]
+            log(f"使用 {len(self.ex)} 檔")
+            return
         rows = fetch([f"{m}_{c}.tw" for c in CODES for m in ("tse", "otc")])
         found = {m["c"]: m.get("ex", "tse") for m in rows}
         self.ex = [f"{found[c]}_{c}.tw" for c in CODES if c in found]
@@ -145,8 +230,9 @@ class Recorder:
                 continue
             si = SEC_OF[code]
             v = num(m.get("v")) or 0.0
-            z = num(m.get("z")) or num(m.get("pz"))
             a1, b1 = first(m.get("a")), first(m.get("b"))
+            # 成交價：z 有時是 "-"，改用 pz、買賣中價或上一次價格，避免漏算成交量
+            z = num(m.get("z")) or num(m.get("pz")) or ((a1 + b1) / 2 if a1 and b1 else None)
             if m.get("d") != self.today:
                 continue
             self.open_today = True
@@ -178,6 +264,8 @@ class Recorder:
                 continue
             dv = v - st["v"]
             counting = st["v"] > 0 and (tmin is None or tmin < AUCTION)
+            if dv > 0 and not z:
+                z = st["p"]
             if dv > 0 and z and counting:
                 if st["a"] and z >= st["a"]:
                     d = 1
@@ -213,6 +301,7 @@ class Recorder:
             "updated": today.strftime("%H:%M:%S"),
             "last_trade_min": None if self.last_t is None else round(self.last_t - START, 2),
             "covered": self.covered,
+            "universe": len(CODES),
             "seeded": self.seeded,
             "method": "bidask",
             "unit": "億元",
@@ -262,6 +351,7 @@ def main():
     if now_min() >= END - 1:
         log("已收盤，不重複記錄（避免覆蓋今天的檔案）")
         return
+    build_universe()
     rec, pusher = Recorder(), Pusher()
     while now_min() < START - 1.5:
         time.sleep(20)
