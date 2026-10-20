@@ -597,6 +597,44 @@ PEEK = {
 }
 
 
+# ---------- 盤中資金流（flow_recorder.py 由 GitHub Actions 每分鐘更新） ----------
+FLOW_REPO = os.environ.get("FLOW_REPO", "Levi56892/twse-mcp")
+FLOW_TTL = int(os.environ.get("FLOW_TTL", "75"))   # 未登入的 GitHub API 每小時 60 次，75 秒快取剛好在額度內
+
+
+def _fetch_flow():
+    # 先走 GitHub API（沒有 CDN 快取，最即時）；被限流時改走 raw（最多約 5 分鐘延遲）
+    headers = {"Accept": "application/vnd.github.raw+json"}
+    tok = os.environ.get("GITHUB_TOKEN")
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    try:
+        r = _session.get(f"https://api.github.com/repos/{FLOW_REPO}/contents/today.json",
+                         params={"ref": "flow"}, headers=headers, timeout=20)
+        if r.status_code == 200:
+            return r.json(), "api"
+    except requests.RequestException:
+        pass
+    r = _session.get(f"https://raw.githubusercontent.com/{FLOW_REPO}/flow/today.json", timeout=20)
+    if r.status_code == 404:
+        return None, "none"
+    r.raise_for_status()
+    return r.json(), "raw"
+
+
+@mcp.tool()
+def get_fund_flow() -> dict:
+    """盤中各產業主動買賣淨額（外盤−內盤金額，單位億元），由 GitHub Actions 在交易日 09:00–13:30 每 15 秒計算、每分鐘存檔。
+    回傳：date, updated(最後存檔時間), last_trade_min(距 09:00 的分鐘數), covered(涵蓋檔數),
+    seeded(是否有開盤後才啟動而用 CLV 估算的部分), sectors:[{name,g}],
+    intensity:[最近一次各產業成交金額], hist:[{m:距 09:00 分鐘, n:[各產業累計淨額，順序同 sectors]}], source。
+    只保留當天；不是交易日或還沒開始記錄時，date 會是之前的日期或回傳 empty=true。"""
+    data, src = _cached("flow", FLOW_TTL, _fetch_flow)
+    if not data:
+        return {"empty": True, "source": src}
+    return {**data, "source": src}
+
+
 @mcp.tool()
 def peek_source(source: str, code: str = "") -> dict:
     """檢查用：看某個資料來源的原始欄位。

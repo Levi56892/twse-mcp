@@ -1,0 +1,294 @@
+"""
+盤中資金流記錄器（給「即時資金流」頁面用）
+由 GitHub Actions 在交易日 08:35 啟動，記錄 09:00–13:30 各產業的主動買賣淨額，
+每分鐘把當天結果存到 flow 分支的 today.json（只保留當天，隔天自動覆蓋）。
+
+外／內盤判斷（證交所 mis 即時資料，每 15 秒一次）：
+  成交價 >= 上一次的最佳賣價 → 外盤（主動買）
+  成交價 <= 上一次的最佳買價 → 內盤（主動賣）
+  介於中間 → 看價格升降；價格不變沿用上一次方向
+開盤第一筆（集合競價）與 13:25 之後的收盤集合競價不計入。
+若程式晚於開盤才啟動，已成交的部分用收盤位置（CLV）估算，並在檔案中標記 seeded。
+"""
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+
+import requests
+
+TW = timezone(timedelta(hours=8))
+MIS = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
+POLL_SEC = 15
+PUSH_SEC = 60
+SEED_K = 0.25
+START = 9 * 60          # 09:00
+AUCTION = 13 * 60 + 25  # 13:25 起收盤集合競價
+END = 13 * 60 + 31      # 13:31 收工
+OUT_DIR = os.environ.get("FLOW_DIR", "flowout")
+REPO = os.environ.get("GITHUB_REPOSITORY", "")
+TOKEN = os.environ.get("GH_TOKEN", "")
+
+# 產業 → 代表股（g：e 電子、t 傳產、f 金融）
+SECTORS = [
+    ("半導體", "e", "2330 2454 2303 3711 2379 3034 6415 3443 3661 2344 2408 5347 6488 3105 5483"),
+    ("電子零組件", "e", "2308 3037 2327 2383 3044 2368 2059 3533 8046 2313"),
+    ("電腦及週邊", "e", "2382 3231 2357 2376 2356 2353 6669 2301 2395 2324 3017"),
+    ("光電", "e", "3008 2409 3481 6176 3406 3714"),
+    ("通信網路", "e", "2412 3045 4904 2345 5388 6285 3596"),
+    ("電子通路", "e", "3702 2347 3036 8112"),
+    ("其他電子", "e", "2317 2360 6409 2404 3030 6139"),
+    ("資訊服務", "e", "6214 2471 2480"),
+    ("電機機械", "t", "1504 1519 1503 1513 2049 1514"),
+    ("電器電纜", "t", "1605 1609 1608"),
+    ("塑膠", "t", "1301 1303 1326 1304 1308"),
+    ("化學工業", "t", "1722 1710 4763 1717"),
+    ("生技醫療", "t", "6446 1795 4743 4147 6472 1760"),
+    ("鋼鐵", "t", "2002 2027 2014 2006 2015"),
+    ("航運", "t", "2603 2609 2615 2618 2610 2637"),
+    ("汽車", "t", "2207 2201 1319 2204"),
+    ("食品", "t", "1216 1227 1210 1229"),
+    ("紡織纖維", "t", "1402 1476 1477 1440"),
+    ("水泥", "t", "1101 1102"),
+    ("建材營造", "t", "2542 2501 5522 2548 2545"),
+    ("油電燃氣", "t", "6505 9908 8926"),
+    ("貿易百貨", "t", "2912 5904 2903 8454"),
+    ("玻璃陶瓷", "t", "1802 1806"),
+    ("綠能環保", "t", "9930 3708 6443 6806"),
+    ("觀光餐旅", "t", "2707 2727 2723"),
+    ("橡膠", "t", "2105 2103 2106"),
+    ("造紙", "t", "1907 1904"),
+    ("金融保險", "f", "2881 2882 2891 2886 2884 2885 2892 5880 2880 2887"),
+]
+NAMES = [s[0] for s in SECTORS]
+SEC_OF = {c: i for i, s in enumerate(SECTORS) for c in s[2].split()}
+CODES = list(SEC_OF)
+
+session = requests.Session()
+session.headers.update({"User-Agent": "Mozilla/5.0 (twse-flow-recorder)"})
+
+
+def log(*a):
+    print(datetime.now(TW).strftime("%H:%M:%S"), *a, flush=True)
+
+
+def now_min():
+    n = datetime.now(TW)
+    return n.hour * 60 + n.minute + n.second / 60
+
+
+def num(x):
+    try:
+        v = float(str(x).replace(",", ""))
+        return v if v > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def first(s):
+    return num(str(s).split("_")[0]) if s else None
+
+
+def fetch(ex_list):
+    """ex_list: ['tse_2330.tw', ...]；回傳有資料的 msgArray。"""
+    if not session.cookies:
+        try:
+            session.get("https://mis.twse.com.tw/stock/index.jsp", timeout=10)
+        except requests.RequestException:
+            pass
+    out = []
+    for i in range(0, len(ex_list), 50):
+        part = "|".join(ex_list[i:i + 50])
+        for attempt in range(2):
+            try:
+                r = session.get(MIS, params={"ex_ch": part, "json": 1, "delay": 0,
+                                             "_": int(time.time() * 1000)}, timeout=10)
+                r.raise_for_status()
+                out += [m for m in r.json().get("msgArray", []) if m.get("c")]
+                break
+            except Exception as e:  # noqa: BLE001
+                log("抓取失敗", type(e).__name__, str(e)[:120])
+                time.sleep(3)
+        time.sleep(0.6)
+    return out
+
+
+class Recorder:
+    def __init__(self):
+        self.nets = [0.0] * len(SECTORS)
+        self.inten = [0.0] * len(SECTORS)
+        self.st = {}           # code -> dict(v, p, a, b, dir)
+        self.hist = []         # [{m, n:[億...]}]
+        self.ex = None         # 決定好的 ex_ch 清單
+        self.seeded = False
+        self.covered = 0
+        self.last_t = None     # 最新成交時間（分鐘，從 0:00 起算）
+        self.today = datetime.now(TW).strftime("%Y%m%d")
+        self.open_today = False  # 有沒有看到今天日期的報價
+
+    def resolve_markets(self):
+        rows = fetch([f"{m}_{c}.tw" for c in CODES for m in ("tse", "otc")])
+        found = {m["c"]: m.get("ex", "tse") for m in rows}
+        self.ex = [f"{found[c]}_{c}.tw" for c in CODES if c in found]
+        missing = [c for c in CODES if c not in found]
+        log(f"找到 {len(self.ex)} 檔", "查無：" + ",".join(missing) if missing else "")
+
+    def step(self):
+        rows = fetch(self.ex)
+        tick = [0.0] * len(SECTORS)
+        n = 0
+        for m in rows:
+            code = m.get("c")
+            if code not in SEC_OF:
+                continue
+            si = SEC_OF[code]
+            v = num(m.get("v")) or 0.0
+            z = num(m.get("z")) or num(m.get("pz"))
+            a1, b1 = first(m.get("a")), first(m.get("b"))
+            if m.get("d") != self.today:
+                continue
+            self.open_today = True
+            t = m.get("t") or ""
+            try:
+                hh, mm, ss = (int(x) for x in t.split(":"))
+                tmin = hh * 60 + mm + ss / 60
+            except ValueError:
+                tmin = None
+            if tmin is not None and (self.last_t is None or tmin > self.last_t):
+                self.last_t = tmin
+            n += 1
+            st = self.st.get(code)
+            if st is None:
+                # 第一次看到：若已有成交，用 CLV 估算開啟前的部分
+                if v > 0:
+                    hi, lo = num(m.get("h")), num(m.get("l"))
+                    p = z or a1 or b1 or num(m.get("y")) or 0
+                    if hi and lo and hi > lo:
+                        clv = ((p - lo) - (hi - p)) / (hi - lo)
+                    else:
+                        y = num(m.get("y")) or p
+                        clv = (p > y) - (p < y)
+                    typ = ((hi or p) + (lo or p) + p) / 3
+                    self.nets[si] += v * 1000 * typ * clv * SEED_K
+                    if now_min() > START + 1:
+                        self.seeded = True
+                self.st[code] = {"v": v, "p": z, "a": a1, "b": b1, "dir": 1}
+                continue
+            dv = v - st["v"]
+            counting = st["v"] > 0 and (tmin is None or tmin < AUCTION)
+            if dv > 0 and z and counting:
+                if st["a"] and z >= st["a"]:
+                    d = 1
+                elif st["b"] and z <= st["b"]:
+                    d = -1
+                elif st["p"] and z != st["p"]:
+                    d = 1 if z > st["p"] else -1
+                else:
+                    d = st["dir"]
+                amt = dv * 1000 * z
+                self.nets[si] += d * amt
+                tick[si] += amt
+                st["dir"] = d
+            if v > st["v"]:
+                st["v"] = v
+            if z:
+                st["p"] = z
+            st["a"], st["b"] = a1 or st["a"], b1 or st["b"]
+        self.covered = n
+        self.inten = tick
+        if self.last_t is not None:
+            m = round(min(max(self.last_t - START, 0), END - START - 1), 2)
+            snap = {"m": m, "n": [round(x / 1e8, 4) for x in self.nets]}
+            if self.hist and int(self.hist[-1]["m"]) == int(m):
+                self.hist[-1] = snap
+            else:
+                self.hist.append(snap)
+
+    def payload(self):
+        today = datetime.now(TW)
+        return {
+            "date": today.strftime("%Y-%m-%d"),
+            "updated": today.strftime("%H:%M:%S"),
+            "last_trade_min": None if self.last_t is None else round(self.last_t - START, 2),
+            "covered": self.covered,
+            "seeded": self.seeded,
+            "method": "bidask",
+            "unit": "億元",
+            "sectors": [{"name": s[0], "g": s[1]} for s in SECTORS],
+            "intensity": [round(x / 1e8, 4) for x in self.inten],
+            "hist": self.hist,
+        }
+
+
+class Pusher:
+    """把 today.json 推到 flow 分支（永遠只有一個 commit）。"""
+
+    def __init__(self):
+        os.makedirs(OUT_DIR, exist_ok=True)
+        self.ok = bool(REPO and TOKEN)
+        self.first = True
+        if not self.ok:
+            log("沒有 GITHUB_REPOSITORY / GH_TOKEN，只寫本機檔案")
+            return
+        url = f"https://x-access-token:{TOKEN}@github.com/{REPO}.git"
+        self.git("init", "-q", "-b", "flow")
+        self.git("remote", "add", "origin", url)
+        self.git("config", "user.name", "flow-recorder")
+        self.git("config", "user.email", "flow-recorder@users.noreply.github.com")
+
+    def git(self, *args):
+        return subprocess.run(["git", *args], cwd=OUT_DIR, capture_output=True, text=True)
+
+    def push(self, data):
+        with open(os.path.join(OUT_DIR, "today.json"), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+        if not self.ok:
+            return
+        self.git("add", "today.json")
+        msg = f"資金流 {data['date']} {data['updated']}"
+        r = self.git("commit", "-q", "-m", msg) if self.first else self.git("commit", "-q", "--amend", "-m", msg)
+        self.first = False
+        r = self.git("push", "-q", "-f", "origin", "flow")
+        if r.returncode != 0:
+            log("推送失敗", r.stderr[-200:])
+
+
+def main():
+    if datetime.now(TW).weekday() >= 5:
+        log("週末，不記錄")
+        return
+    if now_min() >= END - 1:
+        log("已收盤，不重複記錄（避免覆蓋今天的檔案）")
+        return
+    rec, pusher = Recorder(), Pusher()
+    while now_min() < START - 1.5:
+        time.sleep(20)
+    rec.resolve_markets()
+    if not rec.ex:
+        log("抓不到任何報價，結束")
+        sys.exit(1)
+    last_push = 0
+    while now_min() < END:
+        t0 = time.time()
+        try:
+            rec.step()
+        except Exception as e:  # noqa: BLE001
+            log("計算錯誤", type(e).__name__, e)
+        # 09:10 還沒有任何成交 → 休市日
+        if now_min() > START + 10 and not rec.open_today:
+            log("09:10 仍無成交，判斷為休市，結束")
+            return
+        if time.time() - last_push >= PUSH_SEC and rec.hist:
+            pusher.push(rec.payload())
+            last_push = time.time()
+            log(f"已存檔 m={rec.hist[-1]['m']} 涵蓋 {rec.covered} 檔 全市場 {sum(rec.nets)/1e8:+.2f} 億")
+        time.sleep(max(1, POLL_SEC - (time.time() - t0)))
+    rec.step()
+    pusher.push(rec.payload())
+    log("收盤，完成")
+
+
+if __name__ == "__main__":
+    main()
