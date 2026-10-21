@@ -236,6 +236,13 @@ class Recorder:
             a1, b1 = first(m.get("a")), first(m.get("b"))
             # 成交價：z 有時是 "-"，改用 pz、買賣中價或上一次價格，避免漏算成交量
             z = num(m.get("z")) or num(m.get("pz")) or ((a1 + b1) / 2 if a1 and b1 else None)
+            # 漲跌停鎖住時，證交所常把成交價與一邊（或兩邊）報價都給 "-"：用當日最高／最低是否碰到漲跌停價判斷
+            hi_now, lo_now, up, dn = num(m.get("h")), num(m.get("l")), num(m.get("u")), num(m.get("w"))
+            lock = 0
+            if not z and a1 is None and hi_now and up and hi_now >= up:
+                z, lock = up, 1
+            elif not z and b1 is None and lo_now and dn and lo_now <= dn:
+                z, lock = dn, -1
             if m.get("d") != self.today:
                 continue
             self.open_today = True
@@ -255,9 +262,9 @@ class Recorder:
                 # 第一次看到：若已有成交，用 CLV 估算開啟前的部分
                 if v > 0:
                     hi, lo = num(m.get("h")), num(m.get("l"))
-                    p = z or a1 or b1 or num(m.get("y")) or 0
+                    p = z or ((hi + lo) / 2 if hi and lo else None) or num(m.get("y")) or 0
                     if hi and lo and hi > lo:
-                        clv = ((p - lo) - (hi - p)) / (hi - lo)
+                        clv = max(-1.0, min(1.0, ((p - lo) - (hi - p)) / (hi - lo)))
                     else:
                         y = num(m.get("y")) or p
                         clv = (p > y) - (p < y)
@@ -274,7 +281,9 @@ class Recorder:
             if dv > 0 and not z:
                 z = st["p"]
             if dv > 0 and z and counting:
-                if st["a"] is None and st["b"] and z >= st["b"]:
+                if lock:
+                    d = lock
+                elif st["a"] is None and st["b"] and z >= st["b"]:
                     d = 1      # 沒有賣單（漲停鎖住）：成交都是買方追價
                 elif st["b"] is None and st["a"] and z <= st["a"]:
                     d = -1     # 沒有買單（跌停鎖住）：成交都是賣方殺出
