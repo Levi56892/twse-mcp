@@ -277,11 +277,16 @@ class Recorder:
                 self.st[code] = {"v": v, "p": z, "a": a1, "b": b1, "dir": 1}
                 continue
             dv = v - st["v"]
-            counting = st["v"] > 0 and (tmin is None or tmin < AUCTION)
+            opening = st["v"] == 0          # 今天第一筆成交＝開盤集合競價
+            counting = tmin is None or tmin < AUCTION
             if dv > 0 and not z:
                 z = st["p"]
             if dv > 0 and z and counting:
-                if lock:
+                if opening:
+                    # 開盤集合競價：開高（高於昨收）算買、開低算賣、平盤不計
+                    y0 = num(m.get("y"))
+                    d = lock or (((z > y0) - (z < y0)) if y0 else 0)
+                elif lock:
                     d = lock
                 elif st["a"] is None and st["b"] and z >= st["b"]:
                     d = 1      # 沒有賣單（漲停鎖住）：成交都是買方追價
@@ -298,6 +303,8 @@ class Recorder:
                 amt = dv * 1000 * z
                 self.nets[si] += d * amt
                 self.snet[code] = self.snet.get(code, 0.0) + d * amt
+                if not d:
+                    d = st["dir"]
                 tick[si] += amt
                 st["dir"] = d
             if v > st["v"]:
