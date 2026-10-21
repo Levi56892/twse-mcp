@@ -99,7 +99,8 @@ def first(s):
 
 def norm_industry(s):
     s = str(s or "").strip()
-    special = {"電腦及週邊設備業": "電腦及週邊", "觀光事業": "觀光餐旅", "觀光餐旅業": "觀光餐旅"}
+    special = {"電腦及週邊設備業": "電腦及週邊", "觀光事業": "觀光餐旅", "觀光餐旅業": "觀光餐旅",
+               "金融業": "金融保險", "金融保險業": "金融保險"}
     if s in special:
         return special[s]
     if s.endswith("工業"):
@@ -273,7 +274,11 @@ class Recorder:
             if dv > 0 and not z:
                 z = st["p"]
             if dv > 0 and z and counting:
-                if st["a"] and z >= st["a"]:
+                if st["a"] is None and st["b"] and z >= st["b"]:
+                    d = 1      # 沒有賣單（漲停鎖住）：成交都是買方追價
+                elif st["b"] is None and st["a"] and z <= st["a"]:
+                    d = -1     # 沒有買單（跌停鎖住）：成交都是賣方殺出
+                elif st["a"] and z >= st["a"]:
                     d = 1
                 elif st["b"] and z <= st["b"]:
                     d = -1
@@ -290,7 +295,7 @@ class Recorder:
                 st["v"] = v
             if z:
                 st["p"] = z
-            st["a"], st["b"] = a1 or st["a"], b1 or st["b"]
+            st["a"], st["b"] = a1, b1   # 照實記錄，漲跌停時一邊會是空的
         self.covered = n
         self.inten = tick
         if self.last_t is not None:
