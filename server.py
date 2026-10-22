@@ -635,6 +635,62 @@ def get_fund_flow() -> dict:
     return {**data, "source": src}
 
 
+# ---------- 期貨（期交所 MIS，台指期等） ----------
+TAIFEX_MIS = "https://mis.taifex.com.tw/futures/api/getQuoteList"
+
+
+def _taifex_quotes(cid, market_type):
+    body = {"MarketType": market_type, "SymbolType": "F", "KindID": "1", "CID": cid,
+            "ExpireMonth": "", "RowSize": "全部", "PageNo": "", "SortColumn": "", "AscDesc": "A"}
+    r = _session.post(TAIFEX_MIS, json=body, timeout=10,
+                      headers={"Content-Type": "application/json", "Referer": "https://mis.taifex.com.tw/futures/"})
+    r.raise_for_status()
+    d = r.json()
+    return ((d.get("RtData") or {}).get("QuoteList")) or []
+
+
+def _fut_row(q):
+    g = lambda *k: next((q.get(x) for x in k if q.get(x) not in (None, "", "-")), None)
+    price, ref = _num(g("CLastPrice")), _num(g("CRefPrice"))
+    return {
+        "symbol": g("SymbolID"), "name": g("DispCName", "DispEName"),
+        "price": price, "ref": ref,
+        "change": round(price - ref, 2) if price and ref else _num(g("CDiff")),
+        "change_pct": round((price - ref) / ref, 5) if price and ref else None,
+        "open": _num(g("COpenPrice")), "high": _num(g("CHighPrice")), "low": _num(g("CLowPrice")),
+        "volume": _num(g("CTotalVolume")), "time": g("CTime"), "date": g("CDate"),
+    }
+
+
+@mcp.tool()
+def get_futures(cid: str = "TXF", session: str = "auto") -> dict:
+    """取得期貨即時報價（期交所 MIS，約數秒延遲）。cid：TXF 台指期、MXF 小台、TMF 微台等。
+    session：day 日盤、night 夜盤、auto 依台灣時間自動判斷。
+    回傳 near（成交量最大的近月合約）、contracts（各月份）、session。"""
+    now = datetime.now(TW_TZ)
+    hm = now.hour * 100 + now.minute
+    if session == "auto":
+        session = "day" if 830 <= hm <= 1350 else "night"
+    mt = "0" if session == "day" else "1"
+
+    def go():
+        rows = _taifex_quotes(cid, mt)
+        if not rows and mt == "1":
+            rows = _taifex_quotes(cid, "0")
+        return rows
+    try:
+        rows = _cached(f"fut:{cid}:{mt}", QUOTE_TTL, go)
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"{type(e).__name__}: {e}"}
+    contracts = [_fut_row(q) for q in rows]
+    contracts = [c for c in contracts if c["symbol"] and c["symbol"].endswith("-F") and "/" not in c["symbol"]]
+    near = max(contracts, key=lambda c: c["volume"] or 0) if contracts else None
+    out = {"session": session, "near": near, "contracts": contracts[:6]}
+    if not contracts:
+        out["raw_sample"] = rows[:2]
+    return out
+
+
 @mcp.tool()
 def peek_source(source: str, code: str = "") -> dict:
     """檢查用：看某個資料來源的原始欄位。
