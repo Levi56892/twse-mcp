@@ -1,0 +1,41 @@
+name: 記錄台指期夜盤
+
+# 夜盤 15:00～隔天 05:00 共 14 小時，GitHub 一次最多 6 小時，所以分三段接力（台灣時間）：
+# 14:55、20:50、02:45 啟動，另外各排一次備援；同時間只會有一個在跑，每段會接著上一段的紀錄
+on:
+  schedule:
+    - cron: "55 6 * * 1-5"     # 14:55
+    - cron: "10 7 * * 1-5"     # 15:10 備援
+    - cron: "50 12 * * 1-5"    # 20:50
+    - cron: "5 13 * * 1-5"     # 21:05 備援
+    - cron: "45 18 * * 1-5"    # 02:45（隔天凌晨）
+    - cron: "0 19 * * 1-5"     # 03:00 備援
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: night-recorder
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: 取得程式
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安裝套件
+        run: pip install --quiet requests
+
+      - name: 記錄夜盤
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NIGHT_DIR: ${{ runner.temp }}/nightout
+        run: python night_recorder.py
