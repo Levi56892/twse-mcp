@@ -683,12 +683,51 @@ def get_futures(cid: str = "TXF", session: str = "auto") -> dict:
     except Exception as e:  # noqa: BLE001
         return {"error": f"{type(e).__name__}: {e}"}
     contracts = [_fut_row(q) for q in rows]
-    contracts = [c for c in contracts if c["symbol"] and c["symbol"].endswith("-F") and "/" not in c["symbol"]]
+    # 日盤合約代號結尾是 -F，夜盤是 -M；排除價差合約（含 /）與現貨（-S）
+    contracts = [c for c in contracts if c["symbol"] and c["symbol"][-2:] in ("-F", "-M") and "/" not in c["symbol"]
+                 and c["price"]]
+    if not contracts and session == "night":
+        rows = _cached(f"fut:{cid}:0", QUOTE_TTL, lambda: _taifex_quotes(cid, "0"))
+        contracts = [c for c in (_fut_row(q) for q in rows)
+                     if c["symbol"] and c["symbol"][-2:] in ("-F", "-M") and "/" not in c["symbol"] and c["price"]]
+        session = "day"
     near = max(contracts, key=lambda c: c["volume"] or 0) if contracts else None
     out = {"session": session, "near": near, "contracts": contracts[:6]}
     if not contracts:
         out["raw_sample"] = rows[:2]
     return out
+
+
+# ---------- 加權指數盤中走勢（證交所每 5 秒指數統計） ----------
+@mcp.tool()
+def get_index_intraday(date: str = "") -> dict:
+    """取得某交易日加權指數的盤中走勢（證交所「每 5 秒指數統計」，整理成每分鐘一點）。
+    date：YYYYMMDD，不填為今天（台灣時間）。盤中約有數分鐘延遲，收盤後完整。
+    回傳：date, t00:[[距 09:00 的分鐘數, 指數], ...]。"""
+    d = date or datetime.now(TW_TZ).strftime("%Y%m%d")
+
+    def go():
+        r = _session.get("https://www.twse.com.tw/rwd/zh/TAIEX/MI_5MINS_INDEX",
+                         params={"date": d, "response": "json"}, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    try:
+        js = _cached("mi5:" + d, 60, go)
+    except Exception as e:  # noqa: BLE001
+        return {"date": d, "t00": [], "error": f"{type(e).__name__}: {e}"}
+    fields = js.get("fields") or []
+    col = next((i for i, f in enumerate(fields) if "加權" in str(f)), 1)
+    pts = {}
+    for row in js.get("data") or []:
+        try:
+            hh, mm, ss = (int(x) for x in str(row[0]).split(":"))
+            v = _num(row[col])
+        except (ValueError, IndexError):
+            continue
+        if v:
+            m = hh * 60 + mm - 540
+            pts[m] = v          # 同一分鐘取最後一筆
+    return {"date": d, "t00": [[m, pts[m]] for m in sorted(pts)]}
 
 
 @mcp.tool()
