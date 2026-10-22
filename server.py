@@ -730,6 +730,32 @@ def get_index_intraday(date: str = "") -> dict:
     return {"date": d, "t00": [[m, pts[m]] for m in sorted(pts)]}
 
 
+# ---------- 台指期夜盤走勢（night_recorder.py 由 GitHub Actions 每分鐘更新） ----------
+def _fetch_night():
+    headers = {"Accept": "application/vnd.github.raw+json"}
+    tok = os.environ.get("GITHUB_TOKEN")
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    r = _session.get(f"https://api.github.com/repos/{FLOW_REPO}/contents/night.json",
+                     params={"ref": "night"}, headers=headers, timeout=20)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return r.json()
+
+
+@mcp.tool()
+def get_night_futures() -> dict:
+    """台指期夜盤（15:00～隔天 05:00）的盤中走勢，由 GitHub Actions 每 30 秒記錄、每分鐘存檔。
+    回傳：session（夜盤所屬交易日）、symbol、ref、updated、
+    tx:[[距該交易日 09:00 的分鐘數, 價格], ...]（15:00＝360，午夜＝900，05:00＝1200）。"""
+    try:
+        data = _cached("night", FLOW_TTL, _fetch_night)
+    except Exception as e:  # noqa: BLE001
+        return {"empty": True, "error": f"{type(e).__name__}: {e}"}
+    return data or {"empty": True}
+
+
 @mcp.tool()
 def peek_source(source: str, code: str = "") -> dict:
     """檢查用：看某個資料來源的原始欄位。
