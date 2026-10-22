@@ -140,10 +140,15 @@ def main():
             # 只收時間跟現在差 20 分鐘以內的報價（避免 15:00 前讀到上一個夜盤的最後一筆）
             if m is not None and p and m >= 355 and abs(m - m_now) <= 20:
                 arr = data["tx"]
+                vol = num(q.get("CTotalVolume"))
+                if not data.get("first") and vol:
+                    vals = [x for x in (num(q.get(k)) for k in ("COpenPrice", "CHighPrice", "CLowPrice", "CLastPrice")) if x]
+                    data["first"] = {"vol": vol, "typ": round(sum(vals) / len(vals), 2) if vals else p}
+                pt = [m, p, vol] if vol else [m, p]
                 if arr and abs(arr[-1][0] - m) < 0.4:
-                    arr[-1] = [m, p]
+                    arr[-1] = pt
                 elif not arr or m > arr[-1][0]:
-                    arr.append([m, p])
+                    arr.append(pt)
                 data.update(symbol=q.get("SymbolID"), ref=num(q.get("CRefPrice")),
                             high=num(q.get("CHighPrice")), low=num(q.get("CLowPrice")), volume=num(q.get("CTotalVolume")))
         else:

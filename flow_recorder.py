@@ -239,6 +239,7 @@ class Recorder:
         self.thist = []        # 族群：[{m, n:[億...]}]
         self.idx = {"t00": [], "o00": [], "tx": []}   # 加權、櫃買、台指期近月的盤中走勢 [[m, 價]]
         self.tx_sym = None
+        self.tx_first = None
         self.ex = None         # 決定好的 ex_ch 清單
         self.seeded = False
         self.covered = 0
@@ -258,15 +259,16 @@ class Recorder:
         missing = [c for c in CODES if c not in found]
         log(f"找到 {len(self.ex)} 檔", "查無：" + ",".join(missing) if missing else "")
 
-    def _pt(self, key, m, v):
+    def _pt(self, key, m, v, vol=None):
         if m is None or not v:
             return
         m = round(max(0.0, min(m, END - START + 15)), 2)
         arr = self.idx[key]
+        pt = [m, v] if vol is None else [m, v, vol]   # 台指期多記累計成交量，頁面用來算均價
         if arr and abs(arr[-1][0] - m) < 0.25:
-            arr[-1] = [m, v]
+            arr[-1] = pt
         elif not arr or m > arr[-1][0]:
-            arr.append([m, v])
+            arr.append(pt)
 
     def step_index(self, rows):
         for m in rows:
@@ -290,7 +292,13 @@ class Recorder:
                 q = max(ql, key=lambda q: num(q.get("CTotalVolume")) or 0)
                 t = str(q.get("CTime") or "").zfill(6)
                 self.tx_sym = q.get("SymbolID")
-                self._pt("tx", int(t[:2]) * 60 + int(t[2:4]) + int(t[4:6]) / 60 - START, num(q.get("CLastPrice")))
+                vol = num(q.get("CTotalVolume"))
+                if self.tx_first is None and vol:
+                    # 第一次抓到時已成交的量，用 (開+高+低+收)/4 估算均價的起點
+                    o_, h_, l_, c_ = (num(q.get(k)) for k in ("COpenPrice", "CHighPrice", "CLowPrice", "CLastPrice"))
+                    vals = [x for x in (o_, h_, l_, c_) if x]
+                    self.tx_first = {"vol": vol, "typ": round(sum(vals) / len(vals), 2) if vals else c_}
+                self._pt("tx", int(t[:2]) * 60 + int(t[2:4]) + int(t[4:6]) / 60 - START, num(q.get("CLastPrice")), vol)
         except Exception as e:  # noqa: BLE001
             log("台指期抓取失敗", type(e).__name__, str(e)[:100])
 
@@ -433,7 +441,7 @@ class Recorder:
             "themes": [{"name": n, "codes": cs} for n, cs in THEMES],
             "thist": self.thist,
             # 大盤走勢：加權（t00）、櫃買（o00）、台指期近月（tx）
-            "idx": {**self.idx, "tx_symbol": self.tx_sym},
+            "idx": {**self.idx, "tx_symbol": self.tx_sym, "tx_first": self.tx_first},
         }
 
 
