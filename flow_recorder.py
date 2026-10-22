@@ -69,6 +69,7 @@ SEC_OF = {c: i for i, s in enumerate(SECTORS) for c in s[2].split()}
 CODES = list(SEC_OF)
 MARKET = {}   # code -> "tse" / "otc"（自動挑選時填入）
 ALL_MARKET = {}   # 全部股票的市場別（stocks.csv）
+IND = {}          # 全部股票的產業別（給熱力圖用）
 EXTRA_SET = set()
 THEMES = []   # [(族群名稱, [代號...])]，來自 themes.txt
 EXTRA = []    # 只屬於族群、不在產業前 20 名裡的股票
@@ -168,6 +169,7 @@ def build_universe():
                 code, name = str(d.get("公司代號", "")).strip(), norm_industry(d.get("產業別"))
                 if len(code) == 4 and code.isdigit() and name:
                     ind[code] = name
+                    IND[code] = name
         market = {}
         with open(os.path.join(DATA_DIR, "stocks.csv"), encoding="utf-8") as f:
             for line in f.read().splitlines()[1:]:
@@ -231,6 +233,7 @@ class Recorder:
         self.inten = [0.0] * len(SECTORS)
         self.st = {}           # code -> dict(v, p, a, b, dir)
         self.snet = {}         # code -> 個股累計主動買賣淨額（元）
+        self.samt = {}         # code -> 個股累計成交金額（元，估算）
         self.sinfo = {}        # code -> (名稱, 昨收, 最新價)
         self.hist = []         # [{m, n:[億...]}]
         self.thist = []        # 族群：[{m, n:[億...]}]
@@ -303,11 +306,14 @@ class Recorder:
                     if si is not None:
                         self.nets[si] += seed
                     self.snet[code] = self.snet.get(code, 0.0) + seed
+                    self.samt[code] = v * 1000 * typ
                     if now_min() > START + 1:
                         self.seeded = True
                 self.st[code] = {"v": v, "p": z, "a": a1, "b": b1, "dir": 1}
                 continue
             dv = v - st["v"]
+            if dv > 0 and (z or st["p"]):
+                self.samt[code] = self.samt.get(code, 0.0) + dv * 1000 * (z or st["p"])   # 成交金額（含集合競價）
             opening = st["v"] == 0          # 今天第一筆成交＝開盤集合競價
             counting = tmin is None or tmin < AUCTION
             if dv > 0 and not z:
@@ -374,11 +380,14 @@ class Recorder:
             "sectors": [{"name": s[0], "g": s[1]} for s in SECTORS],
             "intensity": [round(x / 1e8, 4) for x in self.inten],
             "hist": self.hist,
-            # 個股最新累計：[代號, 名稱, 產業序號, 淨額(億), 漲跌%]
+            # 個股最新累計：[代號, 名稱, 產業序號, 淨額(億), 漲跌%, 成交金額(億), 市場, 產業別]
             "stocks": [
                 [c, self.sinfo[c][0], SEC_OF.get(c), round(self.snet.get(c, 0.0) / 1e8, 4),
                  round((self.sinfo[c][2] - self.sinfo[c][1]) / self.sinfo[c][1] * 100, 2)
-                 if self.sinfo[c][1] and self.sinfo[c][2] else None]
+                 if self.sinfo[c][1] and self.sinfo[c][2] else None,
+                 round(self.samt.get(c, 0.0) / 1e8, 4),
+                 "上櫃" if (MARKET.get(c) or ALL_MARKET.get(c)) == "otc" else "上市",
+                 IND.get(c)]
                 for c in CODES + EXTRA if c in self.sinfo
             ],
             # 族群（概念股）：成分股與累計淨額走勢
