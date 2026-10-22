@@ -68,6 +68,33 @@ NAMES = [s[0] for s in SECTORS]
 SEC_OF = {c: i for i, s in enumerate(SECTORS) for c in s[2].split()}
 CODES = list(SEC_OF)
 MARKET = {}   # code -> "tse" / "otc"（自動挑選時填入）
+ALL_MARKET = {}   # 全部股票的市場別（stocks.csv）
+EXTRA_SET = set()
+THEMES = []   # [(族群名稱, [代號...])]，來自 themes.txt
+EXTRA = []    # 只屬於族群、不在產業前 20 名裡的股票
+
+
+def load_themes():
+    """讀 themes.txt：每行「族群名稱: 代號 代號 ...」。"""
+    global THEMES, EXTRA
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "themes.txt")
+    out = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or ":" not in line:
+                    continue
+                name, codes = line.split(":", 1)
+                codes = [c for c in codes.replace(",", " ").split() if c.isdigit()]
+                if name.strip() and codes:
+                    out.append((name.strip(), codes))
+    except OSError as e:
+        log("讀不到 themes.txt：", e)
+    THEMES = out
+    have = set(CODES)
+    EXTRA = sorted({c for _, cs in THEMES for c in cs} - have)
+    log(f"族群 {len(THEMES)} 個，另外加抓 {len(EXTRA)} 檔")
 ELEC = {"半導體", "電子零組件", "電腦及週邊", "光電", "通信網路", "電子通路", "其他電子", "資訊服務"}
 TWSE_API = "https://openapi.twse.com.tw/v1"
 TPEX_API = "https://www.tpex.org.tw/openapi/v1"
@@ -147,6 +174,7 @@ def build_universe():
                 c = line.split(",")
                 if len(c) >= 3:
                     market[c[0]] = "otc" if c[2].strip() == "上櫃" else "tse"
+        ALL_MARKET.update(market)
         groups = {}
         for code, name in ind.items():
             if code not in market:
@@ -205,6 +233,7 @@ class Recorder:
         self.snet = {}         # code -> 個股累計主動買賣淨額（元）
         self.sinfo = {}        # code -> (名稱, 昨收, 最新價)
         self.hist = []         # [{m, n:[億...]}]
+        self.thist = []        # 族群：[{m, n:[億...]}]
         self.ex = None         # 決定好的 ex_ch 清單
         self.seeded = False
         self.covered = 0
@@ -214,12 +243,13 @@ class Recorder:
 
     def resolve_markets(self):
         if MARKET:
-            self.ex = [f"{MARKET[c]}_{c}.tw" for c in CODES]
+            self.ex = [f"{MARKET[c]}_{c}.tw" for c in CODES] + \
+                      [f"{ALL_MARKET[c]}_{c}.tw" for c in EXTRA if c in ALL_MARKET]
             log(f"使用 {len(self.ex)} 檔")
             return
-        rows = fetch([f"{m}_{c}.tw" for c in CODES for m in ("tse", "otc")])
+        rows = fetch([f"{m}_{c}.tw" for c in CODES + EXTRA for m in ("tse", "otc")])
         found = {m["c"]: m.get("ex", "tse") for m in rows}
-        self.ex = [f"{found[c]}_{c}.tw" for c in CODES if c in found]
+        self.ex = [f"{found[c]}_{c}.tw" for c in CODES + EXTRA if c in found]
         missing = [c for c in CODES if c not in found]
         log(f"找到 {len(self.ex)} 檔", "查無：" + ",".join(missing) if missing else "")
 
@@ -229,9 +259,9 @@ class Recorder:
         n = 0
         for m in rows:
             code = m.get("c")
-            if code not in SEC_OF:
+            if code not in SEC_OF and code not in EXTRA_SET:
                 continue
-            si = SEC_OF[code]
+            si = SEC_OF.get(code)   # None＝只屬於族群，不計入產業
             v = num(m.get("v")) or 0.0
             a1, b1 = first(m.get("a")), first(m.get("b"))
             # 成交價：z 有時是 "-"，改用 pz、買賣中價或上一次價格，避免漏算成交量
@@ -270,7 +300,8 @@ class Recorder:
                         clv = (p > y) - (p < y)
                     typ = ((hi or p) + (lo or p) + p) / 3
                     seed = v * 1000 * typ * clv * SEED_K
-                    self.nets[si] += seed
+                    if si is not None:
+                        self.nets[si] += seed
                     self.snet[code] = self.snet.get(code, 0.0) + seed
                     if now_min() > START + 1:
                         self.seeded = True
@@ -301,11 +332,13 @@ class Recorder:
                 else:
                     d = st["dir"]
                 amt = dv * 1000 * z
-                self.nets[si] += d * amt
+                if si is not None:
+                    self.nets[si] += d * amt
                 self.snet[code] = self.snet.get(code, 0.0) + d * amt
                 if not d:
                     d = st["dir"]
-                tick[si] += amt
+                if si is not None:
+                    tick[si] += amt
                 st["dir"] = d
             if v > st["v"]:
                 st["v"] = v
@@ -321,6 +354,11 @@ class Recorder:
                 self.hist[-1] = snap
             else:
                 self.hist.append(snap)
+            tsnap = {"m": m, "n": [round(sum(self.snet.get(c, 0.0) for c in cs) / 1e8, 4) for _, cs in THEMES]}
+            if self.thist and int(self.thist[-1]["m"]) == int(m):
+                self.thist[-1] = tsnap
+            else:
+                self.thist.append(tsnap)
 
     def payload(self):
         today = datetime.now(TW)
@@ -329,7 +367,7 @@ class Recorder:
             "updated": today.strftime("%H:%M:%S"),
             "last_trade_min": None if self.last_t is None else round(self.last_t - START, 2),
             "covered": self.covered,
-            "universe": len(CODES),
+            "universe": len(CODES) + len(EXTRA),
             "seeded": self.seeded,
             "method": "bidask",
             "unit": "億元",
@@ -338,11 +376,14 @@ class Recorder:
             "hist": self.hist,
             # 個股最新累計：[代號, 名稱, 產業序號, 淨額(億), 漲跌%]
             "stocks": [
-                [c, self.sinfo[c][0], SEC_OF[c], round(self.snet.get(c, 0.0) / 1e8, 4),
+                [c, self.sinfo[c][0], SEC_OF.get(c), round(self.snet.get(c, 0.0) / 1e8, 4),
                  round((self.sinfo[c][2] - self.sinfo[c][1]) / self.sinfo[c][1] * 100, 2)
                  if self.sinfo[c][1] and self.sinfo[c][2] else None]
-                for c in CODES if c in self.sinfo
+                for c in CODES + EXTRA if c in self.sinfo
             ],
+            # 族群（概念股）：成分股與累計淨額走勢
+            "themes": [{"name": n, "codes": cs} for n, cs in THEMES],
+            "thist": self.thist,
         }
 
 
@@ -387,6 +428,8 @@ def main():
         log("已收盤，不重複記錄（避免覆蓋今天的檔案）")
         return
     build_universe()
+    load_themes()
+    EXTRA_SET.update(EXTRA)
     rec, pusher = Recorder(), Pusher()
     while now_min() < START - 1.5:
         time.sleep(20)
