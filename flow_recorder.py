@@ -237,6 +237,8 @@ class Recorder:
         self.sinfo = {}        # code -> (名稱, 昨收, 最新價)
         self.hist = []         # [{m, n:[億...]}]
         self.thist = []        # 族群：[{m, n:[億...]}]
+        self.idx = {"t00": [], "o00": [], "tx": []}   # 加權、櫃買、台指期近月的盤中走勢 [[m, 價]]
+        self.tx_sym = None
         self.ex = None         # 決定好的 ex_ch 清單
         self.seeded = False
         self.covered = 0
@@ -256,8 +258,45 @@ class Recorder:
         missing = [c for c in CODES if c not in found]
         log(f"找到 {len(self.ex)} 檔", "查無：" + ",".join(missing) if missing else "")
 
+    def _pt(self, key, m, v):
+        if m is None or not v:
+            return
+        m = round(max(0.0, min(m, END - START + 15)), 2)
+        arr = self.idx[key]
+        if arr and abs(arr[-1][0] - m) < 0.25:
+            arr[-1] = [m, v]
+        elif not arr or m > arr[-1][0]:
+            arr.append([m, v])
+
+    def step_index(self, rows):
+        for m in rows:
+            c = m.get("c")
+            if c in ("t00", "o00") and m.get("d") == self.today:
+                z = num(m.get("z")) or num(m.get("pz"))
+                try:
+                    hh, mm, ss = (int(x) for x in (m.get("t") or "").split(":"))
+                    self._pt(c, hh * 60 + mm + ss / 60 - START, z)
+                except ValueError:
+                    pass
+        # 台指期（期交所 MIS）：取成交量最大的近月合約
+        try:
+            body = {"MarketType": "0", "SymbolType": "F", "KindID": "1", "CID": "TXF", "ExpireMonth": "",
+                    "RowSize": "全部", "PageNo": "", "SortColumn": "", "AscDesc": "A"}
+            r = session.post("https://mis.taifex.com.tw/futures/api/getQuoteList", json=body, timeout=10,
+                             headers={"Referer": "https://mis.taifex.com.tw/futures/"})
+            ql = ((r.json().get("RtData") or {}).get("QuoteList")) or []
+            ql = [q for q in ql if str(q.get("SymbolID", "")).endswith("-F") and "/" not in str(q.get("SymbolID", ""))]
+            if ql:
+                q = max(ql, key=lambda q: num(q.get("CTotalVolume")) or 0)
+                t = str(q.get("CTime") or "").zfill(6)
+                self.tx_sym = q.get("SymbolID")
+                self._pt("tx", int(t[:2]) * 60 + int(t[2:4]) + int(t[4:6]) / 60 - START, num(q.get("CLastPrice")))
+        except Exception as e:  # noqa: BLE001
+            log("台指期抓取失敗", type(e).__name__, str(e)[:100])
+
     def step(self):
-        rows = fetch(self.ex)
+        rows = fetch(self.ex + ["tse_t00.tw", "otc_o00.tw"])
+        self.step_index(rows)
         tick = [0.0] * len(SECTORS)
         n = 0
         for m in rows:
@@ -393,6 +432,8 @@ class Recorder:
             # 族群（概念股）：成分股與累計淨額走勢
             "themes": [{"name": n, "codes": cs} for n, cs in THEMES],
             "thist": self.thist,
+            # 大盤走勢：加權（t00）、櫃買（o00）、台指期近月（tx）
+            "idx": {**self.idx, "tx_symbol": self.tx_sym},
         }
 
 
