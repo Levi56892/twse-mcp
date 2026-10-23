@@ -19,6 +19,31 @@ from mcp.server.fastmcp import FastMCP
 PORT = int(os.environ.get("PORT", "8000"))
 mcp = FastMCP("twse-quotes", host="0.0.0.0", port=PORT, stateless_http=True)
 
+# 每個工具都丟到背景執行緒跑：某個資料來源很慢（例如證交所連線逾時）時，
+# 只有那個工具在等，伺服器本身和其他工具照常回應，不會整台卡住讓連接器顯示「無法連線」。
+import functools
+import inspect
+import anyio
+
+_orig_tool = mcp.tool
+
+
+def _threaded_tool(*args, **kwargs):
+    deco = _orig_tool(*args, **kwargs)
+
+    def wrap(fn):
+        if inspect.iscoroutinefunction(fn):
+            return deco(fn)
+
+        @functools.wraps(fn)
+        async def runner(*a, **k):
+            return await anyio.to_thread.run_sync(functools.partial(fn, *a, **k))
+        return deco(runner)
+    return wrap
+
+
+mcp.tool = _threaded_tool
+
 MIS_URL = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 TWSE = "https://openapi.twse.com.tw/v1"
 TPEX = "https://www.tpex.org.tw/openapi/v1"
