@@ -288,6 +288,44 @@ def fetch_fred():
     return out
 
 
+# ---------- 近一個月走勢（指數卡片的小線圖） ----------
+MONTH_FRED = [("SPY", "SP500"), ("QQQ", "NASDAQ100"), ("DIA", "DJIA")]   # 用官方指數收盤代表對應 ETF 的走勢
+DAILY_KEEP = ["SOXX", "SPY", "QQQ", "DIA"]                              # 自己累積每天收盤（費半沒有官方免費日線）
+
+
+def fetch_month(dhist):
+    out = {}
+    since = (datetime.now(ET) - timedelta(days=40)).strftime("%Y-%m-%d")
+    for sym, sid in MONTH_FRED:
+        try:
+            rows = []
+            if FRED_KEY:
+                r = http.get("https://api.stlouisfed.org/fred/series/observations",
+                             params={"series_id": sid, "observation_start": since, "api_key": FRED_KEY, "file_type": "json"},
+                             timeout=20)
+                r.raise_for_status()
+                for o in r.json().get("observations", []):
+                    try:
+                        rows.append([o["date"], float(o["value"])])
+                    except (KeyError, ValueError):
+                        pass
+            if rows:
+                out[sym] = rows[-23:]
+        except Exception as e:  # noqa: BLE001
+            log("一個月走勢失敗", sid, err(e))
+    try:
+        r = http.get("https://api.exchange.coinbase.com/products/BTC-USD/candles", params={"granularity": 86400}, timeout=15)
+        r.raise_for_status()
+        rows = sorted(r.json(), key=lambda x: x[0])[-31:]      # [時間, 低, 高, 開, 收, 量]
+        out["BTC"] = [[datetime.fromtimestamp(x[0], ET).strftime("%Y-%m-%d"), x[4]] for x in rows]
+    except Exception as e:  # noqa: BLE001
+        log("BTC 日線失敗", err(e))
+    for sym in DAILY_KEEP:                 # 官方來源沒有的，用自己累積的每日收盤
+        if sym not in out and len(dhist.get(sym, [])) >= 3:
+            out[sym] = dhist[sym][-23:]
+    return out
+
+
 # ---------- 存到 us 分支 ----------
 class Store:
     def __init__(self):
@@ -350,8 +388,19 @@ def main():
     date = now.strftime("%Y-%m-%d")
     store = Store()
     prev = store.prev if (store.prev and store.prev.get("date") == date) else None
+    # 每日收盤歷史跨日保留：新的一天先把前一天的收盤記進去
+    dhist = (store.prev or {}).get("dhist", {})
+    if store.prev and store.prev.get("date") != date:
+        for sym in DAILY_KEEP:
+            q = (store.prev.get("quotes") or {}).get(sym) or {}
+            if q.get("p"):
+                arr = dhist.setdefault(sym, [])
+                if not arr or arr[-1][0] != store.prev["date"]:
+                    arr.append([store.prev["date"], q["p"]])
+                del arr[:-40]
     data = prev or {"date": date, "series": {k: [] for k in SERIES}, "flow": [], "quotes": {}, "mcap": {},
                     "sectors": SECTORS, "stocks": {}, "intensity": [], "macro": {}}
+    data["dhist"] = dhist
     data["sectors"] = SECTORS
     for k in SERIES:
         data["series"].setdefault(k, [])
@@ -362,6 +411,7 @@ def main():
     threading.Thread(target=trades.run, daemon=True).start()
 
     data["macro"] = fetch_fred() or data.get("macro", {})
+    data["month"] = fetch_month(dhist) or data.get("month", {})
     last_fred = time.time()
     quotes = data["quotes"]
     pool = [s for s, _, _ in WS if INFO[s][1]] + [s for s, _, _ in EXTRA]
@@ -402,6 +452,7 @@ def main():
             quotes["BTC"] = btc
         if time.time() - last_fred > 3600:
             data["macro"] = fetch_fred() or data["macro"]
+            data["month"] = fetch_month(dhist) or data.get("month", {})
             last_fred = time.time()
 
         # 4) 整理成一分鐘快照
