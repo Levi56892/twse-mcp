@@ -1,6 +1,6 @@
 """
 美股記錄器（給「美股戰情室」用）
-由 GitHub Actions 在美股交易日啟動，記錄紐約時間 08:00（盤前）到 16:15（盤後初段），
+由 GitHub Actions 在美股交易日啟動，記錄紐約時間 08:00（盤前）到 19:30（盤後），
 每分鐘把當天結果存到 us 分支的 us.json（只保留當天，隔天自動覆蓋）。
 GitHub Actions 一次最多 6 小時，所以分兩段接力，第二段會讀回第一段的紀錄繼續記。
 
@@ -35,7 +35,7 @@ OUT_DIR = os.environ.get("US_DIR", "usout")
 REPO = os.environ.get("GITHUB_REPOSITORY", "")
 TOKEN = os.environ.get("GH_TOKEN", "")
 START_M = -90            # 08:00 ET 開始
-END_M = 405              # 16:15 ET 收工
+END_M = 600              # 19:30 ET 收工（含盤後交易）
 MAX_RUN_SEC = 5 * 3600 + 50 * 60
 REST_PER_MIN = 45        # 留 15 次給「台股報價」連接器的 get_us_quotes
 
@@ -158,7 +158,8 @@ class Trades:
         for s in WS_SYMS:
             p = (prev_stocks or {}).get(s) or {}
             self.st[s] = {"last": p.get("p"), "dir": 0, "buy": (p.get("buy") or 0) * 1e6, "sell": (p.get("sell") or 0) * 1e6,
-                          "dv": (p.get("dv") or 0) * 1e6, "h": p.get("h"), "l": p.get("l"), "t": 0, "n": 0}
+                          "dv": (p.get("dv") or 0) * 1e6, "h": p.get("h"), "l": p.get("l"), "t": 0, "n": 0,
+                          "rc": p.get("rc"), "ext": p.get("x")}
         self.minute_dv = {g: 0.0 for g in SECTORS}
         self.count = 0
         self.last_trade = time.time()
@@ -176,6 +177,10 @@ class Trades:
                 elif p < st["last"]:
                     st["dir"] = -1
             st["last"], st["t"] = p, t
+            if reg:
+                st["rc"] = p          # 正規時段最新價（16:00 後就是收盤價）
+            else:
+                st["ext"] = p         # 盤前／盤後最新價
             self.count += 1
             self.last_trade = time.time()
             if reg:
@@ -374,22 +379,39 @@ def main():
         m = et_min()
         with trades.lock:
             for s, st in trades.st.items():
-                if st["last"]:
-                    q = quotes.setdefault(s, {})
-                    q["p"] = st["last"]
+                q = quotes.setdefault(s, {})
+                # 漲跌一律用正規時段價格算；盤前、盤後價另外放在 xp
+                if st["rc"]:
+                    q["p"] = st["rc"]
+                if st["ext"] and (m < 0 or m >= 390):
+                    q["xp"] = st["ext"]
                     if 0 <= m < 390 and st["h"] is not None:
                         q["h"], q["l"] = st["h"], st["l"]
             stocks = {s: {"p": r2(st["last"], 3), "buy": r2(st["buy"] / 1e6), "sell": r2(st["sell"] / 1e6),
                           "net": r2((st["buy"] - st["sell"]) / 1e6), "dv": r2(st["dv"] / 1e6),
-                          "h": st["h"], "l": st["l"]} for s, st in trades.st.items() if INFO[s][1]}
+                          "h": st["h"], "l": st["l"], "rc": r2(st["rc"], 3),
+                          "x": r2(st["ext"], 3) if (m < 0 or m >= 390) else None}
+                      for s, st in trades.st.items() if INFO[s][1]}
+            lasts = {s: st["last"] for s, st in trades.st.items() if st["last"]}
             inten = {g: r2(v / 1e6) for g, v in trades.minute_dv.items()}
             trades.minute_dv = {g: 0.0 for g in SECTORS}
             ws_count = trades.count
         data["stocks"] = stocks
         for k in SERIES:
             q = quotes.get(k)
-            if q and q.get("p"):
-                push_pt(data["series"][k], m, q["p"])
+            v = lasts.get(k) or (q or {}).get("p")      # 有逐筆成交的用最新成交價（含盤前盤後）
+            if v:
+                push_pt(data["series"][k], m, v)
+        # 個股日內走勢（每 2 分鐘一點，給「盤面焦點」的小走勢圖）
+        sp = data.setdefault("spark", {})
+        b = int(m // 2) * 2
+        for s2, v in lasts.items():
+            if INFO[s2][1]:
+                arr = sp.setdefault(s2, [])
+                if arr and arr[-1][0] == b:
+                    arr[-1] = [b, r2(v, 2)]
+                elif not arr or b > arr[-1][0]:
+                    arr.append([b, r2(v, 2)])
         if 0 <= m <= 391:
             nets = [0.0] * len(SECTORS)
             for s, v in stocks.items():
