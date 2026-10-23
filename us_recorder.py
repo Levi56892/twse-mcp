@@ -80,11 +80,11 @@ ETF = [
     ("XLK", "科技", "sec"), ("XLC", "通訊服務", "sec"), ("XLY", "非必需消費", "sec"), ("XLF", "金融", "sec"),
     ("XLV", "醫療保健", "sec"), ("XLI", "工業", "sec"), ("XLE", "能源", "sec"), ("XLP", "必需消費", "sec"),
     ("XLU", "公用事業", "sec"), ("XLB", "原物料", "sec"), ("XLRE", "房地產", "sec"),
-    ("TLT", "20年美債", "mac"), ("UUP", "美元", "mac"), ("USO", "原油", "mac"), ("GLD", "黃金", "mac"),
+    ("TLT", "20年美債", "mac"), ("UUP", "美元", "mac"), ("USO", "WTI原油", "mac"), ("BNO", "布蘭特原油", "mac"), ("GLD", "黃金", "mac"), ("SLV", "白銀", "mac"),
 ]
-SERIES = ["SPY", "QQQ", "DIA", "IWM", "SOXX", "TLT", "UUP", "USO", "GLD", "TSM", "NVDA", "BTC"]
-FRED = [("VIXCLS", "VIX 恐慌指數"), ("DGS10", "10年期美債殖利率"), ("DGS2", "2年期美債殖利率"),
-        ("DTWEXBGS", "美元廣義指數"), ("DCOILWTICO", "WTI 原油"), ("DEXTAUS", "美元兌台幣")]
+SERIES = ["SPY", "QQQ", "DIA", "IWM", "SOXX", "TLT", "UUP", "USO", "BNO", "GLD", "SLV", "TSM", "NVDA", "BTC"]
+FRED = [("VIXCLS", "VIX 恐慌指數"), ("DGS10", "10年期美債殖利率"), ("DGS30", "30年期美債殖利率"),
+        ("DCOILWTICO", "WTI 原油"), ("DCOILBRENTEU", "布蘭特原油"), ("DTWEXBGS", "美元廣義指數"), ("DEXTAUS", "美元兌台幣")]
 
 SECTORS = []
 for _, _, g in WS + EXTRA:
