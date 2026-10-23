@@ -20,6 +20,7 @@ import csv
 import io
 import json
 import os
+import re
 import subprocess
 import threading
 import time
@@ -102,6 +103,15 @@ def log(*a):
     print(datetime.now(ET).strftime("%H:%M:%S ET"), *a, flush=True)
 
 
+
+def err(e):
+    """錯誤訊息去掉網址裡的金鑰再寫進紀錄。"""
+    resp = getattr(e, "response", None)
+    if resp is not None and getattr(resp, "status_code", None):
+        return f"{type(e).__name__} HTTP {resp.status_code}"
+    return re.sub(r"(token|api_key)=[^&\s'\"]+", r"\1=***", f"{type(e).__name__}: {e}")[:120]
+
+
 def et_min(dt=None):
     dt = dt or datetime.now(ET)
     return dt.hour * 60 + dt.minute + dt.second / 60 - 570
@@ -136,11 +146,15 @@ class Finnhub:
         try:
             q = self.get("/quote", symbol=sym)
         except Exception as e:  # noqa: BLE001
-            log("quote 失敗", sym, type(e).__name__, str(e)[:80])
+            log("quote 失敗", sym, err(e))
             return None
         if not q or not q.get("c"):
             return None
-        return {"p": q["c"], "pc": q.get("pc"), "o": q.get("o"), "h": q.get("h"), "l": q.get("l"), "t": q.get("t")}
+        t = q.get("t")
+        if t and datetime.fromtimestamp(t, ET).date() < datetime.now(ET).date():
+            # 今天還沒開盤：Finnhub 仍回傳前一個交易日的資料，此時「昨收」應該是它的收盤價 c
+            return {"p": q["c"], "pc": q["c"], "o": None, "h": None, "l": None, "t": t}
+        return {"p": q["c"], "pc": q.get("pc"), "o": q.get("o"), "h": q.get("h"), "l": q.get("l"), "t": t}
 
     def mcap(self, sym):
         try:
@@ -216,7 +230,7 @@ class Trades:
 
         while not self.stop:
             ws = websocket.WebSocketApp(f"wss://ws.finnhub.io?token={KEY}", on_open=on_open, on_message=on_message,
-                                        on_error=lambda ws, e: log("WebSocket 錯誤", str(e)[:120]))
+                                        on_error=lambda ws, e: log("WebSocket 錯誤", err(e)))
             ws.run_forever(ping_interval=30, ping_timeout=10)
             if not self.stop:
                 log("WebSocket 中斷，5 秒後重連")
@@ -232,30 +246,45 @@ def fetch_btc():
         last, op = float(j["last"]), float(j["open"])
         return {"p": last, "pc": op, "h": float(j["high"]), "l": float(j["low"]), "note": "24小時"}
     except Exception as e:  # noqa: BLE001
-        log("BTC 失敗", type(e).__name__, str(e)[:80])
+        log("BTC 失敗", err(e))
         return None
 
 
+FRED_KEY = os.environ.get("FRED_API_KEY", "").strip()
+
+
 def fetch_fred():
+    """FRED 官方 API（需免費金鑰 FRED_API_KEY）；沒有金鑰時試網站的 CSV 下載（雲端主機常被擋）。"""
     out = {}
     since = (datetime.now(ET) - timedelta(days=45)).strftime("%Y-%m-%d")
     for sid, name in FRED:
         try:
-            r = http.get("https://fred.stlouisfed.org/graph/fredgraph.csv", params={"id": sid, "cosd": since}, timeout=20)
-            r.raise_for_status()
             rows = []
-            for row in csv.reader(io.StringIO(r.text)):
-                if len(row) >= 2:
+            if FRED_KEY:
+                r = http.get("https://api.stlouisfed.org/fred/series/observations",
+                             params={"series_id": sid, "observation_start": since, "api_key": FRED_KEY, "file_type": "json"},
+                             timeout=20)
+                r.raise_for_status()
+                for o in r.json().get("observations", []):
                     try:
-                        rows.append((row[0], float(row[1])))
-                    except ValueError:
+                        rows.append((o["date"], float(o["value"])))
+                    except (KeyError, ValueError):
                         pass
+            else:
+                r = http.get("https://fred.stlouisfed.org/graph/fredgraph.csv", params={"id": sid, "cosd": since}, timeout=20)
+                r.raise_for_status()
+                for row in csv.reader(io.StringIO(r.text)):
+                    if len(row) >= 2:
+                        try:
+                            rows.append((row[0], float(row[1])))
+                        except ValueError:
+                            pass
             if rows:
                 out[sid] = {"name": name, "date": rows[-1][0], "v": rows[-1][1],
                             "prev": rows[-2][1] if len(rows) > 1 else None,
                             "hist": [[d, v] for d, v in rows[-30:]]}
         except Exception as e:  # noqa: BLE001
-            log("FRED 失敗", sid, type(e).__name__, str(e)[:80])
+            log("FRED 失敗", sid, err(e))
     return out
 
 
