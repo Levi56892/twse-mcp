@@ -4,6 +4,7 @@
   - 盤中報價（上市、上櫃）：證交所「基本市況報導」查詢接口 mis.twse.com.tw（約數秒延遲，非官方 API）
   - 盤後資料（上市）：證交所 OpenAPI  openapi.twse.com.tw
   - 盤後資料（上櫃、興櫃）：櫃買中心 OpenAPI  www.tpex.org.tw/openapi
+  - 美股：Finnhub 官方 API（FINNHUB_API_KEY），us_recorder.py 記錄的 us 分支
 回傳格式一律是「列」(list of dict)，讓看板可以直接當表格使用。
 """
 import csv
@@ -754,6 +755,83 @@ def get_night_futures() -> dict:
     except Exception as e:  # noqa: BLE001
         return {"empty": True, "error": f"{type(e).__name__}: {e}"}
     return data or {"empty": True}
+
+
+# ---------- 美股（us_recorder.py 由 GitHub Actions 每分鐘更新；即時報價走 Finnhub） ----------
+FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
+
+
+def _fetch_us():
+    headers = {"Accept": "application/vnd.github.raw+json"}
+    tok = os.environ.get("GITHUB_TOKEN")
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    try:
+        r = _session.get(f"https://api.github.com/repos/{FLOW_REPO}/contents/us.json",
+                         params={"ref": "us"}, headers=headers, timeout=20)
+        if r.status_code == 200:
+            return r.json()
+    except requests.RequestException:
+        pass
+    r = _session.get(f"https://raw.githubusercontent.com/{FLOW_REPO}/us/us.json", timeout=20)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return r.json()
+
+
+@mcp.tool()
+def get_us_war_room() -> dict:
+    """美股戰情室資料（由 GitHub Actions 在美股交易日紐約時間 08:00–16:15 每分鐘記錄，只保留最近一個交易日）。
+    回傳：date(紐約日期), updated(紐約時間), updated_ts(UNIX 秒), phase(pre 盤前/reg 盤中/post 盤後), tz_offset(紐約對 UTC 時差),
+    quotes:{代號:{p 現價, pc 昨收, o, h, l}}（指數／類股／債券美元原油黃金 ETF、80 檔大型股、BTC），
+    series:{代號:[[m, 價格]...]}（m＝距紐約 09:30 的分鐘數，盤前為負），
+    sectors:[板塊名稱], flow:[{m, n:[各板塊累計主動買賣淨額，百萬美元]}], intensity:[最近一分鐘各板塊成交金額],
+    stocks:{代號:{p, buy, sell, net, dv(成交金額), h, l}}（百萬美元，正規時段 tick rule 估算），
+    mcap:{代號:市值(百萬美元)}, names:{代號:中文名}, sector_of:{代號:板塊},
+    macro:{FRED 序列:{name, date, v, prev, hist}}（VIX、10Y、2Y、美元廣義指數、WTI、美元兌台幣，每日資料）。"""
+    try:
+        data = _cached("us", FLOW_TTL, _fetch_us)
+    except Exception as e:  # noqa: BLE001
+        return {"empty": True, "error": f"{type(e).__name__}: {e}"}
+    return data or {"empty": True}
+
+
+@mcp.tool()
+def get_us_quotes(symbols: list[str]) -> list[dict]:
+    """美股即時報價（Finnhub 官方 API，需在伺服器設定 FINNHUB_API_KEY），一次最多 15 檔，快取 15 秒。
+    symbols：美股代號，例如 ["NVDA", "TSM", "SPY"]。
+    回傳每檔一列：symbol, price, prev_close, change, change_pct, open, high, low, time(UNIX 秒)。"""
+    if not FINNHUB_KEY:
+        raise ValueError("伺服器還沒設定 FINNHUB_API_KEY（Render → Environment）")
+    syms = []
+    for s in symbols or []:
+        s = str(s).strip().upper()
+        if re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,9}", s) and s not in syms:
+            syms.append(s)
+    if not syms:
+        raise ValueError("請提供至少一個美股代號，例如 ['NVDA','TSM']")
+    if len(syms) > 15:
+        raise ValueError("一次最多 15 檔")
+    rows = []
+    for s in syms:
+        def go(s=s):
+            r = _session.get("https://finnhub.io/api/v1/quote", params={"symbol": s, "token": FINNHUB_KEY}, timeout=10)
+            r.raise_for_status()
+            return r.json()
+        try:
+            q = _cached("usq:" + s, QUOTE_TTL, go)
+        except Exception as e:  # noqa: BLE001
+            rows.append({"symbol": s, "error": f"{type(e).__name__}"})
+            continue
+        if not q or not q.get("c"):
+            rows.append({"symbol": s, "error": "查無資料"})
+            continue
+        pc = q.get("pc")
+        rows.append({"symbol": s, "price": q["c"], "prev_close": pc,
+                     "change": q.get("d"), "change_pct": round(q["c"] / pc - 1, 5) if pc else None,
+                     "open": q.get("o"), "high": q.get("h"), "low": q.get("l"), "time": q.get("t")})
+    return rows
 
 
 @mcp.tool()

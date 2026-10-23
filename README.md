@@ -72,3 +72,13 @@ gcloud run deploy twse-quotes --source . --region asia-east1 --allow-unauthentic
 
 連接器（server.py）的 `get_stock_history`、`get_revenue_history`、`get_financials_history`、`get_holder_history` 會直接讀 data 分支上的檔案。
 若存放空間不在 `Levi56892/twse-mcp`，請在 Render 的 Environment 設定 `DATA_BASE=https://raw.githubusercontent.com/<帳號>/<存放空間>/data`。
+
+## 美股戰情室（us_recorder.py）
+
+`us_recorder.py` 由 GitHub Actions（`.github/workflows/us.yml`）在美股交易日紐約時間 08:00–16:15 執行，每分鐘把結果存到 **us 分支**的 `us.json`；連接器的 `get_us_war_room` 讀這個檔案，`get_us_quotes` 直接查 Finnhub 即時報價。
+
+需要一組 Finnhub 免費金鑰，設定在兩個地方：
+- GitHub：Settings → Secrets and variables → Actions → New repository secret，名稱 `FINNHUB_API_KEY`
+- Render：服務的 Environment，新增 `FINNHUB_API_KEY`
+
+資料來源：Finnhub 官方 API（美股逐筆成交、報價、市值）、Coinbase 公開 API（比特幣）、FRED（VIX、美債殖利率、美元指數、原油、美元兌台幣，每日）。
