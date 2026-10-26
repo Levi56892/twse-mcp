@@ -316,8 +316,9 @@ def fetch_month(dhist):
     try:
         r = http.get("https://api.exchange.coinbase.com/products/BTC-USD/candles", params={"granularity": 86400}, timeout=15)
         r.raise_for_status()
-        rows = sorted(r.json(), key=lambda x: x[0])[-31:]      # [時間, 低, 高, 開, 收, 量]
-        out["BTC"] = [[datetime.fromtimestamp(x[0], ET).strftime("%Y-%m-%d"), x[4]] for x in rows]
+        rows = sorted(r.json(), key=lambda x: x[0])[-180:]     # [時間, 低, 高, 開, 收, 量]
+        out["BTC"] = [[datetime.fromtimestamp(x[0], ET).strftime("%Y-%m-%d"), x[4]] for x in rows[-31:]]
+        out["_btc_k"] = [[datetime.fromtimestamp(x[0], ET).strftime("%Y-%m-%d"), x[3], x[2], x[1], x[4]] for x in rows]
     except Exception as e:  # noqa: BLE001
         log("BTC 日線失敗", err(e))
     for sym in DAILY_KEEP:                 # 官方來源沒有的，用自己累積的每日收盤
@@ -398,9 +399,20 @@ def main():
                 if not arr or arr[-1][0] != store.prev["date"]:
                     arr.append([store.prev["date"], q["p"]])
                 del arr[:-40]
+    # 日 K（開高低收）：同樣每天收盤後存一根，最多保留約一年
+    dk = (store.prev or {}).get("dk", {})
+    if store.prev and store.prev.get("date") != date:
+        for sym in DAILY_KEEP:
+            q = (store.prev.get("quotes") or {}).get(sym) or {}
+            if q.get("p") and q.get("o"):
+                arr = dk.setdefault(sym, [])
+                if not arr or arr[-1][0] != store.prev["date"]:
+                    arr.append([store.prev["date"], q["o"], q.get("h") or q["p"], q.get("l") or q["p"], q["p"]])
+                del arr[:-260]
     data = prev or {"date": date, "series": {k: [] for k in SERIES}, "flow": [], "quotes": {}, "mcap": {},
                     "sectors": SECTORS, "stocks": {}, "intensity": [], "macro": {}}
     data["dhist"] = dhist
+    data["dk"] = {**data.get("dk", {}), **dk}
     data["sectors"] = SECTORS
     for k in SERIES:
         data["series"].setdefault(k, [])
@@ -412,6 +424,8 @@ def main():
 
     data["macro"] = fetch_fred() or data.get("macro", {})
     data["month"] = fetch_month(dhist) or data.get("month", {})
+    if "_btc_k" in data["month"]:
+        data["dk"]["BTC"] = data["month"].pop("_btc_k")
     last_fred = time.time()
     quotes = data["quotes"]
     pool = [s for s, _, _ in WS if INFO[s][1]] + [s for s, _, _ in EXTRA]
@@ -453,6 +467,8 @@ def main():
         if time.time() - last_fred > 3600:
             data["macro"] = fetch_fred() or data["macro"]
             data["month"] = fetch_month(dhist) or data.get("month", {})
+            if "_btc_k" in data["month"]:
+                data["dk"]["BTC"] = data["month"].pop("_btc_k")
             last_fred = time.time()
 
         # 4) 整理成一分鐘快照
