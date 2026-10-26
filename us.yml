@@ -1,0 +1,49 @@
+name: 記錄美股
+
+# 記錄紐約時間 08:00（盤前）～16:15，結果存到 us 分支的 us.json。
+# GitHub 一次最多跑 6 小時，所以分兩段接力；美國夏令／冬令時間差一小時，兩種都各排一次（UTC 時間）：
+#   第一段：11:50、12:50 啟動（＝紐約 07:50），12:10、13:10 備援
+#   第二段：17:40、18:40 啟動（＝紐約 13:40），18:00、19:00 備援
+# 同時間只會有一個在跑；不在時段內啟動的會馬上結束，不會覆蓋資料。
+on:
+  schedule:
+    # GitHub 的排程常常延遲甚至略過，所以在兩段開始前後每 10 分鐘各排一次；
+    # 已經在記錄時，多排的會等它結束後啟動、發現不在時段或已有人在記就立刻結束。
+    - cron: "40,50 11 * * 1-5"
+    - cron: "0,10,20,30,40,50 12 * * 1-5"
+    - cron: "0,10,20,30,40,50 13 * * 1-5"
+    - cron: "0,10,20,30 14 * * 1-5"
+    - cron: "30,40,50 17 * * 1-5"
+    - cron: "0,10,20,30,40,50 18 * * 1-5"
+    - cron: "0,10,20 19 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: us-recorder
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: 取得程式
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 安裝套件
+        run: pip install --quiet requests websocket-client tzdata
+
+      - name: 記錄美股
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          US_DIR: ${{ runner.temp }}/usout
+        run: python us_recorder.py

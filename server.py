@@ -853,8 +853,15 @@ def get_us_quotes(symbols: list[str]) -> list[dict]:
             rows.append({"symbol": s, "error": "查無資料"})
             continue
         pc = q.get("pc")
+        try:
+            from zoneinfo import ZoneInfo
+            et = ZoneInfo("America/New_York")
+            if q.get("t") and datetime.fromtimestamp(q["t"], et).date() < datetime.now(et).date():
+                pc = q["c"]       # 今天還沒開盤：Finnhub 仍是前一交易日資料，今天漲跌先算 0
+        except Exception:  # noqa: BLE001
+            pass
         rows.append({"symbol": s, "price": q["c"], "prev_close": pc,
-                     "change": q.get("d"), "change_pct": round(q["c"] / pc - 1, 5) if pc else None,
+                     "change": round(q["c"] - pc, 4) if pc else None, "change_pct": round(q["c"] / pc - 1, 5) if pc else None,
                      "open": q.get("o"), "high": q.get("h"), "low": q.get("l"), "time": q.get("t")})
     return rows
 
