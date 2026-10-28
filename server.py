@@ -1078,5 +1078,77 @@ def peek_source(source: str, code: str = "") -> dict:
     return {"rows": len(data), "sample": row}
 
 
+# ---------- 盤中資金流記錄器（在 Render 上自己跑，不再依賴 GitHub 排程） ----------
+import threading
+
+_rec = {"thread": None, "day": None, "status": "idle", "started": None}
+
+
+def _rec_run():
+    import importlib
+    try:
+        os.environ.setdefault("FLOW_WRITER", "render")
+        import flow_recorder as fr
+        fr = importlib.reload(fr)          # 每天重新載入，清掉前一天的狀態
+        _rec["status"] = "recording"
+        fr.main()
+        _rec["status"] = "done"
+    except BaseException as e:  # noqa: BLE001
+        _rec["status"] = f"error: {type(e).__name__}: {e}"
+
+
+def _rec_should_run(now):
+    hm = now.hour * 100 + now.minute
+    return now.weekday() < 5 and 845 <= hm < 1332
+
+
+def _rec_start(force=False):
+    now = datetime.now(TW_TZ)
+    day = now.strftime("%Y-%m-%d")
+    t = _rec["thread"]
+    if t and t.is_alive():
+        return "already_running"
+    if not os.environ.get("GH_WRITE_TOKEN"):
+        return "no_token"
+    if not force and not _rec_should_run(now):
+        return "outside_hours"
+    if _rec["day"] == day and _rec["status"] == "done" and not force:
+        return "done_today"
+    _rec.update(day=day, started=now.strftime("%H:%M:%S"), status="starting")
+    _rec["thread"] = threading.Thread(target=_rec_run, name="flow-recorder", daemon=True)
+    _rec["thread"].start()
+    return "started"
+
+
+def _scheduler():
+    """每分鐘檢查一次：交易日 08:45～13:32 之間沒在記錄就啟動；記錄中每 5 分鐘戳自己一下，避免 Render 休眠。"""
+    self_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    n = 0
+    while True:
+        try:
+            if _rec_should_run(datetime.now(TW_TZ)):
+                _rec_start()
+                n += 1
+                if self_url and n % 5 == 0:
+                    try:
+                        _session.get(self_url + "/mcp", timeout=20)
+                    except requests.RequestException:
+                        pass
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(60)
+
+
+@mcp.tool()
+def start_recorder(force: bool = False) -> dict:
+    """喚醒伺服器並啟動「盤中資金流記錄器」（交易日 08:45～13:32 有效；force=true 可在其他時間手動啟動）。
+    回傳：result（started / already_running / outside_hours / done_today / no_token）、status、day、started。"""
+    r = _rec_start(force=force)
+    return {"result": r, "status": _rec["status"], "day": _rec["day"], "started": _rec["started"]}
+
+
+threading.Thread(target=_scheduler, name="rec-scheduler", daemon=True).start()
+
+
 if __name__ == "__main__":
     mcp.run(transport="streamable-http")

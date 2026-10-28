@@ -28,10 +28,13 @@ PUSH_SEC = 25   # 每輪抓完就存檔（約 30 秒一次）
 SEED_K = 0.25
 START = 9 * 60          # 09:00
 AUCTION = 13 * 60 + 25  # 13:25 起收盤集合競價
-END = 13 * 60 + 31      # 13:31 收工
+END = 13 * 60 + 33      # 13:33 收工（多等 3 分鐘，收進收盤集合競價那一筆）
 OUT_DIR = os.environ.get("FLOW_DIR", "flowout")
 REPO = os.environ.get("GITHUB_REPOSITORY", "")
 TOKEN = os.environ.get("GH_TOKEN", "")
+WRITER = os.environ.get("FLOW_WRITER", "actions")      # 誰在記錄：actions 或 render
+API_TOKEN = os.environ.get("GH_WRITE_TOKEN", "")        # Render 用：可寫入 repo 的金鑰（走 GitHub API，不需要 git）
+API_REPO = os.environ.get("FLOW_REPO", REPO or "Levi56892/twse-mcp")
 
 # 備用清單：自動挑選失敗時才用（g：e 電子、t 傳產、f 金融）
 SECTORS = [
@@ -157,6 +160,51 @@ def avg_turnover(code, days=20):
     return sum(vals) / len(vals) if vals else 0.0
 
 
+def gh_get_today():
+    """讀 flow 分支上的 today.json（回傳 (資料, sha)）；讀不到回傳 (None, None)。"""
+    h = {"Accept": "application/vnd.github+json"}
+    tok = API_TOKEN or os.environ.get("GITHUB_TOKEN", "") or TOKEN
+    if tok:
+        h["Authorization"] = f"Bearer {tok}"
+    try:
+        r = session.get(f"https://api.github.com/repos/{API_REPO}/contents/today.json", params={"ref": "flow"},
+                        headers=h, timeout=20)
+        if r.status_code != 200:
+            return None, None
+        js = r.json()
+        import base64
+        return json.loads(base64.b64decode(js["content"]).decode("utf-8")), js.get("sha")
+    except Exception as e:  # noqa: BLE001
+        log("讀取 today.json 失敗", type(e).__name__, str(e)[:100])
+        return None, None
+
+
+def universe_from_payload(pl):
+    """沒有 data 分支時（Render）：沿用上一次記錄的股票清單（各產業前 20 名＋族群成分股）。"""
+    global SECTORS, NAMES, SEC_OF, CODES
+    try:
+        secs = pl["sectors"]
+        groups = {i: [] for i in range(len(secs))}
+        for st in pl["stocks"]:
+            c, si = st[0], st[2]
+            if si is not None and si in groups:
+                groups[si].append(c)
+            if len(st) > 6:
+                ALL_MARKET[c] = "otc" if st[6] == "上櫃" else "tse"
+            if len(st) > 7 and st[7]:
+                IND[c] = st[7]
+        SECTORS = [(secs[i]["name"], secs[i].get("g", "t"), " ".join(groups[i])) for i in range(len(secs)) if groups[i]]
+        NAMES = [x[0] for x in SECTORS]
+        SEC_OF = {c: i for i, x in enumerate(SECTORS) for c in x[2].split()}
+        CODES = list(SEC_OF)
+        MARKET.update({c: ALL_MARKET.get(c, "tse") for c in CODES})
+        log(f"沿用上次清單：{len(SECTORS)} 個產業、{len(CODES)} 檔")
+        return True
+    except Exception as e:  # noqa: BLE001
+        log("沿用清單失敗", type(e).__name__, e)
+        return False
+
+
 def build_universe():
     """全部上市櫃普通股依產業分組，每組取近 20 日平均成交金額前 TOP_N 名。失敗就用備用清單。"""
     global SECTORS, NAMES, SEC_OF, CODES
@@ -246,6 +294,7 @@ class Recorder:
         self.last_t = None     # 最新成交時間（分鐘，從 0:00 起算）
         self.today = datetime.now(TW).strftime("%Y%m%d")
         self.open_today = False  # 有沒有看到今天日期的報價
+        self.resumed = False     # 接續同一天已存的紀錄（伺服器重啟時）
 
     def resolve_markets(self):
         if MARKET:
@@ -339,8 +388,8 @@ class Recorder:
             self.sinfo[code] = (m.get("n") or code, y, z or (self.sinfo.get(code) or (0, 0, None))[2])
             st = self.st.get(code)
             if st is None:
-                # 第一次看到：若已有成交，用 CLV 估算開啟前的部分
-                if v > 0:
+                # 第一次看到：若已有成交，用 CLV 估算開啟前的部分（接續舊紀錄時不估，舊紀錄已含）
+                if v > 0 and not (self.resumed and code in self.snet):
                     hi, lo = num(m.get("h")), num(m.get("l"))
                     p = z or ((hi + lo) / 2 if hi and lo else None) or num(m.get("y")) or 0
                     if hi and lo and hi > lo:
@@ -420,6 +469,7 @@ class Recorder:
             "updated": today.strftime("%H:%M:%S"),
             "last_trade_min": None if self.last_t is None else round(self.last_t - START, 2),
             "covered": self.covered,
+            "writer": WRITER,
             "universe": len(CODES) + len(EXTRA),
             "seeded": self.seeded,
             "method": "bidask",
@@ -450,8 +500,13 @@ class Pusher:
 
     def __init__(self):
         os.makedirs(OUT_DIR, exist_ok=True)
-        self.ok = bool(REPO and TOKEN)
+        self.api = bool(API_TOKEN)
+        self.sha = None
+        self.ok = bool(REPO and TOKEN) and not self.api
         self.first = True
+        if self.api:
+            log("用 GitHub API 存檔（Render 模式）")
+            return
         if not self.ok:
             log("沒有 GITHUB_REPOSITORY / GH_TOKEN，只寫本機檔案")
             return
@@ -467,6 +522,25 @@ class Pusher:
     def push(self, data):
         with open(os.path.join(OUT_DIR, "today.json"), "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+        if self.api:
+            import base64
+            body = {"message": f"資金流 {data['date']} {data['updated']}", "branch": "flow",
+                    "content": base64.b64encode(json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).decode()}
+            h = {"Authorization": f"Bearer {API_TOKEN}", "Accept": "application/vnd.github+json"}
+            url = f"https://api.github.com/repos/{API_REPO}/contents/today.json"
+            for _ in range(2):
+                if self.sha is None:
+                    _, self.sha = gh_get_today()
+                if self.sha:
+                    body["sha"] = self.sha
+                try:
+                    r = session.put(url, json=body, headers=h, timeout=30)
+                except requests.RequestException as e:
+                    log("推送失敗", type(e).__name__); return
+                if r.status_code in (200, 201):
+                    self.sha = r.json().get("content", {}).get("sha"); return
+                log("推送失敗", r.status_code, r.text[:150]); self.sha = None
+            return
         if not self.ok:
             return
         self.git("add", "today.json")
@@ -478,6 +552,42 @@ class Pusher:
             log("推送失敗", r.stderr[-200:])
 
 
+def resume(rec, pl):
+    """伺服器中途重啟：把今天已存的紀錄接回來，從現在繼續記。"""
+    try:
+        names = [x["name"] for x in pl["sectors"]]
+        last = pl["hist"][-1]["n"]
+        for i, nm in enumerate(names):
+            if nm in NAMES:
+                rec.nets[NAMES.index(nm)] = (last[i] or 0) * 1e8
+        rec.hist = pl["hist"] if names == NAMES else []
+        rec.thist = pl.get("thist") or []
+        for k in ("t00", "o00", "tx"):
+            rec.idx[k] = (pl.get("idx") or {}).get(k) or []
+        rec.tx_first = (pl.get("idx") or {}).get("tx_first")
+        for st in pl.get("stocks") or []:
+            rec.snet[st[0]] = (st[3] or 0) * 1e8
+            if len(st) > 5 and st[5]:
+                rec.samt[st[0]] = st[5] * 1e8
+        rec.seeded = bool(pl.get("seeded"))
+        rec.resumed = True
+        log(f"接續今天的紀錄：{len(rec.hist)} 點")
+    except Exception as e:  # noqa: BLE001
+        log("接續失敗，重新開始", type(e).__name__, e)
+
+
+def other_writer_active():
+    """今天已經有另一個記錄器（actions / render）在 4 分鐘內存過檔 → True。"""
+    pl, _ = gh_get_today()
+    if not pl or pl.get("date") != datetime.now(TW).strftime("%Y-%m-%d") or pl.get("writer", "actions") == WRITER:
+        return False
+    try:
+        hh, mm, ss = (int(x) for x in pl.get("updated", "0:0:0").split(":"))
+        return now_min() - (hh * 60 + mm + ss / 60) < 4
+    except ValueError:
+        return False
+
+
 def main():
     if datetime.now(TW).weekday() >= 5:
         log("週末，不記錄")
@@ -485,10 +595,19 @@ def main():
     if now_min() >= END - 1:
         log("已收盤，不重複記錄（避免覆蓋今天的檔案）")
         return
-    build_universe()
+    if other_writer_active():
+        log("另一個記錄器正在記錄，這次不重複")
+        return
+    prev, _ = gh_get_today() if (API_TOKEN or not os.path.isdir(DATA_DIR)) else (None, None)
+    if os.path.isdir(DATA_DIR):
+        build_universe()
+    elif not (prev and universe_from_payload(prev)):
+        log("沒有 data 分支也沒有上次清單，改用備用清單")
     load_themes()
     EXTRA_SET.update(EXTRA)
     rec, pusher = Recorder(), Pusher()
+    if prev and prev.get("date") == datetime.now(TW).strftime("%Y-%m-%d") and prev.get("hist"):
+        resume(rec, prev)
     while now_min() < START - 1.5:
         time.sleep(20)
     rec.resolve_markets()
