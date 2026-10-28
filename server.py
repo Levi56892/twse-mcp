@@ -866,6 +866,198 @@ def get_us_quotes(symbols: list[str]) -> list[dict]:
     return rows
 
 
+# ---------- K 線（加權、櫃買、台指期；日 K 與今日分 K） ----------
+def _roc_to_iso(s):
+    """115/10/27 或 2026/10/27 → 2026-10-27"""
+    p = re.split(r"[/-]", str(s).strip())
+    if len(p) != 3:
+        return None
+    y = int(p[0]);  y = y + 1911 if y < 1911 else y
+    return f"{y:04d}-{int(p[1]):02d}-{int(p[2]):02d}"
+
+
+def _months_back(n):
+    now = datetime.now(TW_TZ)
+    y, m = now.year, now.month
+    out = []
+    for _ in range(n):
+        out.append((y, m))
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    return out[::-1]
+
+
+def _twse_json(path, date, ttl):
+    def go():
+        r = _session.get(f"https://www.twse.com.tw/rwd/zh/{path}", params={"date": date, "response": "json"}, timeout=20)
+        r.raise_for_status()
+        return r.json()
+    return _cached(f"twse:{path}:{date}", ttl, go)
+
+
+def _taiex_daily(months):
+    bars = {}
+    for y, m in _months_back(months):
+        d = f"{y:04d}{m:02d}01"
+        cur = (y, m) == _months_back(1)[0]
+        ttl = 600 if cur else 86400
+        try:
+            px = _twse_json("indicesReport/MI_5MINS_HIST", d, ttl)
+            for row in px.get("data") or []:
+                k = _roc_to_iso(row[0])
+                if k:
+                    bars[k] = [k, _num(row[1]), _num(row[2]), _num(row[3]), _num(row[4]), None]
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            vo = _twse_json("afterTrading/FMTQIK", d, ttl)
+            f = vo.get("fields") or []
+            ci = next((i for i, x in enumerate(f) if "成交金額" in str(x)), 2)
+            for row in vo.get("data") or []:
+                k = _roc_to_iso(row[0])
+                if k in bars:
+                    v = _num(row[ci])
+                    bars[k][5] = round(v / 1e8, 2) if v else None      # 億元
+        except Exception:  # noqa: BLE001
+            pass
+    return [bars[k] for k in sorted(bars)]
+
+
+def _taiex_minute(date):
+    d = date or datetime.now(TW_TZ).strftime("%Y%m%d")
+    px = _twse_json("TAIEX/MI_5MINS_INDEX", d, 60)
+    f = px.get("fields") or []
+    col = next((i for i, x in enumerate(f) if "加權" in str(x)), 1)
+    bars = {}
+    for row in px.get("data") or []:
+        try:
+            hh, mm, ss = (int(x) for x in str(row[0]).split(":"))
+            v = _num(row[col])
+        except (ValueError, IndexError):
+            continue
+        if not v:
+            continue
+        m = hh * 60 + mm - 540 + (1 if ss > 0 else 0)      # 09:00:05～09:01:00 → 第 1 分鐘
+        b = bars.get(m)
+        if not b:
+            bars[m] = [m, v, v, v, v, 0.0]
+        else:
+            b[2] = max(b[2], v); b[3] = min(b[3], v); b[4] = v
+    try:
+        vo = _twse_json("afterTrading/MI_5MINS", d, 60)
+        f = vo.get("fields") or []
+        ci = next((i for i, x in enumerate(f) if "成交金額" in str(x)), len(f) - 1)
+        last, prev_m = None, None
+        for row in vo.get("data") or []:
+            try:
+                hh, mm, ss = (int(x) for x in str(row[0]).split(":"))
+                cum = _num(row[ci])
+            except (ValueError, IndexError):
+                continue
+            if cum is None:
+                continue
+            m = hh * 60 + mm - 540 + (1 if ss > 0 else 0)
+            if last is not None and m in bars and cum >= last:
+                bars[m][5] += (cum - last) / 1e8
+            last = cum
+        for b in bars.values():
+            b[5] = round(b[5], 2)
+    except Exception:  # noqa: BLE001
+        pass
+    return [bars[m] for m in sorted(bars)]
+
+
+def _tpex_daily(months):
+    bars = {}
+    for y, m in _months_back(months):
+        cur = (y, m) == _months_back(1)[0]
+        ttl = 600 if cur else 86400
+        def go(y=y, m=m):
+            r = _session.get("https://www.tpex.org.tw/www/zh-tw/indexInfo/inxh",
+                             params={"date": f"{y:04d}/{m:02d}/01", "response": "json"}, timeout=20)
+            r.raise_for_status()
+            return r.json()
+        try:
+            js = _cached(f"tpexinx:{y}{m}", ttl, go)
+            tables = js.get("tables") or [js]
+            for t in tables:
+                f = t.get("fields") or []
+                for row in t.get("data") or []:
+                    k = _roc_to_iso(row[0])
+                    if not k:
+                        continue
+                    get = lambda key, dflt: _num(row[next((i for i, x in enumerate(f) if key in str(x)), dflt)])
+                    bars[k] = [k, get("開", 1), get("高", 2), get("低", 3), get("收", 4), None]
+        except Exception:  # noqa: BLE001
+            pass
+    return [bars[k] for k in sorted(bars)]
+
+
+def _tx_daily(months):
+    end = datetime.now(TW_TZ)
+    start = end - timedelta(days=31 * months)
+    bars = {}
+    cur = start
+    while cur <= end:
+        nxt = min(end, cur + timedelta(days=30))
+        a, b = cur.strftime("%Y/%m/%d"), nxt.strftime("%Y/%m/%d")
+        def go(a=a, b=b):
+            r = _session.post("https://www.taifex.com.tw/cht/3/futDataDown",
+                              data={"down_type": "1", "commodity_id": "TX", "queryStartDate": a, "queryEndDate": b},
+                              timeout=30)
+            r.raise_for_status()
+            return r.content.decode("big5", errors="ignore")
+        try:
+            txt = _cached(f"txd:{a}:{b}", 600 if nxt >= end - timedelta(days=1) else 86400, go)
+            rows = list(csv.reader(io.StringIO(txt)))
+            head = [h.strip() for h in rows[0]] if rows else []
+            ix = lambda key: next((i for i, h in enumerate(head) if key in h), None)
+            i_d, i_m, i_o, i_h, i_l, i_c, i_v, i_s = (ix("交易日期"), ix("到期月份"), ix("開盤價"), ix("最高價"),
+                                                         ix("最低價"), ix("收盤價"), ix("成交量"), ix("交易時段"))
+            day = {}
+            for r_ in rows[1:]:
+                try:
+                    if i_s is not None and "一般" not in r_[i_s]:
+                        continue                        # 只取日盤
+                    if "/" in r_[i_m]:
+                        continue                        # 排除價差
+                    k = _roc_to_iso(r_[i_d]); v = _num(r_[i_v]) or 0
+                    o, h, l, c = (_num(r_[i]) for i in (i_o, i_h, i_l, i_c))
+                except (IndexError, TypeError, ValueError):
+                    continue
+                if k and o and c and (k not in day or v > day[k][5]):
+                    day[k] = [k, o, h, l, c, v]         # 每天取成交量最大的合約（近月）
+            bars.update(day)
+        except Exception:  # noqa: BLE001
+            pass
+        cur = nxt + timedelta(days=1)
+    return [bars[k] for k in sorted(bars)]
+
+
+@mcp.tool()
+def get_kline(symbol: str = "TAIEX", period: str = "day", months: int = 6, date: str = "") -> dict:
+    """K 線資料。symbol：TAIEX（加權）、TPEX（櫃買）、TX（台指期近月日盤）。
+    period：day 日 K（months 個月，最多 24）；minute 今日 1 分 K（目前只有 TAIEX，含每分鐘成交金額）。
+    回傳 bars：[[日期或距 09:00 的分鐘數, 開, 高, 低, 收, 量]]；量的單位：TAIEX 為成交金額（億元），TX 為口數，TPEX 目前沒有量。"""
+    sym = symbol.upper()
+    months = max(1, min(int(months or 6), 24))
+    try:
+        if period == "minute":
+            if sym != "TAIEX":
+                return {"symbol": sym, "period": period, "bars": [], "error": "分 K 目前只支援 TAIEX，其他請用雲端記錄的走勢"}
+            return {"symbol": sym, "period": period, "unit": "億元", "bars": _taiex_minute(date)}
+        if sym == "TAIEX":
+            return {"symbol": sym, "period": "day", "unit": "億元", "bars": _taiex_daily(months)}
+        if sym == "TPEX":
+            return {"symbol": sym, "period": "day", "unit": None, "bars": _tpex_daily(months)}
+        if sym == "TX":
+            return {"symbol": sym, "period": "day", "unit": "口", "bars": _tx_daily(months)}
+        return {"symbol": sym, "bars": [], "error": "symbol 只能是 TAIEX、TPEX、TX"}
+    except Exception as e:  # noqa: BLE001
+        return {"symbol": sym, "period": period, "bars": [], "error": f"{type(e).__name__}: {e}"}
+
+
 @mcp.tool()
 def peek_source(source: str, code: str = "") -> dict:
     """檢查用：看某個資料來源的原始欄位。
