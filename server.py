@@ -888,12 +888,29 @@ def _months_back(n):
     return out[::-1]
 
 
+_KDEBUG = []
+
+
+def _kdbg(msg):
+    _KDEBUG.append(str(msg)[:200])
+
+
 def _twse_json(path, date, ttl):
     def go():
-        r = _session.get(f"https://www.twse.com.tw/rwd/zh/{path}", params={"date": date, "response": "json"}, timeout=20)
+        r = _session.get(f"https://www.twse.com.tw/rwd/zh/{path}", params={"date": date, "response": "json"}, timeout=20,
+                         headers={"Referer": "https://www.twse.com.tw/zh/"})
         r.raise_for_status()
-        return r.json()
-    return _cached(f"twse:{path}:{date}", ttl, go)
+        js = r.json()
+        n = len(js.get("data") or [])
+        if not n:
+            _kdbg(f"{path} {date}: stat={js.get('stat')} keys={list(js)[:6]}")
+            raise ValueError("no data")       # 不快取空結果，下次再試
+        return js
+    try:
+        return _cached(f"twse:{path}:{date}", ttl, go)
+    except Exception as e:  # noqa: BLE001
+        _kdbg(f"{path} {date}: {type(e).__name__} {e}")
+        raise
 
 
 def _taiex_daily(months):
@@ -919,8 +936,8 @@ def _taiex_daily(months):
                 if k in bars:
                     v = _num(row[ci])
                     bars[k][5] = round(v / 1e8, 2) if v else None      # 億元
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as e:  # noqa: BLE001
+            _kdbg(f"taiex daily {d}: {e}")
     return [bars[k] for k in sorted(bars)]
 
 
@@ -980,6 +997,8 @@ def _tpex_daily(months):
             return r.json()
         try:
             js = _cached(f"tpexinx:{y}{m}", ttl, go)
+            if not (js.get("tables") or js.get("data")):
+                _kdbg(f"tpex {y}{m}: keys={list(js)[:6]} stat={js.get('stat')}")
             tables = js.get("tables") or [js]
             for t in tables:
                 f = t.get("fields") or []
@@ -1029,8 +1048,10 @@ def _tx_daily(months):
                 if k and o and c and (k not in day or v > day[k][5]):
                     day[k] = [k, o, h, l, c, v]         # 每天取成交量最大的合約（近月）
             bars.update(day)
-        except Exception:  # noqa: BLE001
-            pass
+            if not day:
+                _kdbg(f"tx {a}~{b}: rows={len(rows)} head={head[:8]}")
+        except Exception as e:  # noqa: BLE001
+            _kdbg(f"tx {a}~{b}: {type(e).__name__} {e}")
         cur = nxt + timedelta(days=1)
     return [bars[k] for k in sorted(bars)]
 
@@ -1042,17 +1063,22 @@ def get_kline(symbol: str = "TAIEX", period: str = "day", months: int = 6, date:
     回傳 bars：[[日期或距 09:00 的分鐘數, 開, 高, 低, 收, 量]]；量的單位：TAIEX 為成交金額（億元），TX 為口數，TPEX 目前沒有量。"""
     sym = symbol.upper()
     months = max(1, min(int(months or 6), 24))
+    _KDEBUG.clear()
     try:
         if period == "minute":
             if sym != "TAIEX":
                 return {"symbol": sym, "period": period, "bars": [], "error": "分 K 目前只支援 TAIEX，其他請用雲端記錄的走勢"}
-            return {"symbol": sym, "period": period, "unit": "億元", "bars": _taiex_minute(date)}
+            b = _taiex_minute(date)
+            return {"symbol": sym, "period": period, "unit": "億元", "bars": b, "debug": _KDEBUG[:8]}
         if sym == "TAIEX":
-            return {"symbol": sym, "period": "day", "unit": "億元", "bars": _taiex_daily(months)}
+            b = _taiex_daily(months)
+            return {"symbol": sym, "period": "day", "unit": "億元", "bars": b, "debug": _KDEBUG[:8]}
         if sym == "TPEX":
-            return {"symbol": sym, "period": "day", "unit": None, "bars": _tpex_daily(months)}
+            b = _tpex_daily(months)
+            return {"symbol": sym, "period": "day", "unit": None, "bars": b, "debug": _KDEBUG[:8]}
         if sym == "TX":
-            return {"symbol": sym, "period": "day", "unit": "口", "bars": _tx_daily(months)}
+            b = _tx_daily(months)
+            return {"symbol": sym, "period": "day", "unit": "口", "bars": b, "debug": _KDEBUG[:8]}
         return {"symbol": sym, "bars": [], "error": "symbol 只能是 TAIEX、TPEX、TX"}
     except Exception as e:  # noqa: BLE001
         return {"symbol": sym, "period": period, "bars": [], "error": f"{type(e).__name__}: {e}"}
