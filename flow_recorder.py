@@ -318,6 +318,8 @@ def fetch(ex_list):
                 log("抓取失敗", type(e).__name__, str(e)[:120])
                 time.sleep(3)
         time.sleep(1.2)   # 每批間隔 1.2 秒，不要抓太兇
+    if not out and ex_list:
+        session.cookies.clear()   # 整輪都沒資料：通常是證交所連線過期，下一輪重新取得
     return out
 
 
@@ -398,8 +400,9 @@ class Recorder:
             log("台指期抓取失敗", type(e).__name__, str(e)[:100])
 
     def step(self):
-        rows = fetch(self.ex + ["tse_t00.tw", "otc_o00.tw"])
-        self.step_index(rows)
+        # 大盤先單獨抓：不受全市場一輪 30 多批的影響，任何一批失敗都不會讓指數斷掉
+        self.step_index(fetch(["tse_t00.tw", "otc_o00.tw"]))
+        rows = fetch(self.ex)
         tick = [0.0] * len(SECTORS)
         n = 0
         for m in rows:
@@ -606,8 +609,12 @@ def resume(rec, pl):
         for i, nm in enumerate(names):
             if nm in NAMES:
                 rec.nets[NAMES.index(nm)] = (last[i] or 0) * 1e8
-        rec.hist = pl["hist"] if names == NAMES else []
-        rec.thist = pl.get("thist") or []
+        # 產業順序不同（換了股票清單）：依產業名稱重新對應，早上的走勢不會丟掉
+        pos = [names.index(nm) if nm in names else None for nm in NAMES]
+        rec.hist = [{"m": h["m"], "n": [(h["n"][j] or 0) if j is not None and j < len(h["n"]) else 0 for j in pos]}
+                    for h in pl["hist"]]
+        tn = [t.get("name") for t in pl.get("themes") or []]
+        rec.thist = (pl.get("thist") or []) if tn == [n for n, _ in THEMES] else []
         for k in ("t00", "o00", "tx"):
             rec.idx[k] = (pl.get("idx") or {}).get(k) or []
         rec.tx_first = (pl.get("idx") or {}).get("tx_first")
@@ -646,10 +653,10 @@ def main():
         return
     prev, _ = gh_get_today()
     today = datetime.now(TW).strftime("%Y-%m-%d")
-    if prev and prev.get("date") == today and universe_from_payload(prev):
+    if FULL and build_universe_full():
+        pass                                   # 全部上市櫃普通股（盤中重啟也用全市場，不退回今天較小的清單）
+    elif prev and prev.get("date") == today and universe_from_payload(prev):
         pass                                   # 盤中重啟：沿用今天的清單接著記
-    elif FULL and build_universe_full():
-        pass                                   # 全部上市櫃普通股
     elif os.path.isdir(DATA_DIR):
         build_universe()                       # 備援：各產業前 20 名
     elif not (prev and universe_from_payload(prev)):
@@ -672,8 +679,8 @@ def main():
             rec.step()
         except Exception as e:  # noqa: BLE001
             log("計算錯誤", type(e).__name__, e)
-        # 09:10 還沒有任何成交 → 休市日
-        if now_min() > START + 10 and not rec.open_today:
+        # 09:10 還沒有任何成交 → 休市日（盤中重啟接續今天紀錄時不判斷，抓不到就繼續重試）
+        if now_min() > START + 10 and not rec.open_today and not rec.resumed:
             log("09:10 仍無成交，判斷為休市，結束")
             return
         if time.time() - last_push >= PUSH_SEC and rec.hist:
