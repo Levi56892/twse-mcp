@@ -22,6 +22,7 @@ import requests
 TW = timezone(timedelta(hours=8))
 MIS = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 POLL_SEC = 30
+FULL = os.environ.get("FULL_UNIVERSE", "1") == "1"   # 1＝全部上市櫃普通股；0＝各產業前 20 名
 TOP_N = int(os.environ.get("TOP_N", "20"))   # 每個產業取近 20 日成交金額前 N 名
 DATA_DIR = os.environ.get("DATA_DIR", "databr")  # data 分支（含每日成交量）
 PUSH_SEC = 25   # 每輪抓完就存檔（約 30 秒一次）
@@ -251,6 +252,51 @@ def build_universe():
         log("自動挑選失敗，改用備用清單：", type(e).__name__, str(e)[:200])
 
 
+def build_universe_full():
+    """全部上市櫃普通股（約 1,800 檔），依官方產業別分組。股票清單取自 data 分支的 stocks.csv。"""
+    global SECTORS, NAMES, SEC_OF, CODES
+    try:
+        ind = {}
+        for base, path in ((TWSE_API, "/opendata/t187ap05_L"), (TPEX_API, "/mopsfin_t187ap05_O")):
+            r = session.get(base + path, timeout=60)
+            r.raise_for_status()
+            for d in r.json():
+                code, name = str(d.get("公司代號", "")).strip(), norm_industry(d.get("產業別"))
+                if len(code) == 4 and code.isdigit() and not code.startswith("0") and name:
+                    ind[code] = name
+                    IND[code] = name
+        local = os.path.join(DATA_DIR, "stocks.csv")
+        if os.path.exists(local):
+            txt = open(local, encoding="utf-8").read()
+        else:
+            r = session.get(f"https://raw.githubusercontent.com/{API_REPO}/data/stocks.csv", timeout=60)
+            r.raise_for_status()
+            txt = r.content.decode("utf-8")
+        market = {}
+        for line in txt.splitlines()[1:]:
+            c = line.split(",")
+            if len(c) >= 3:
+                market[c[0]] = "otc" if c[2].strip() == "上櫃" else "tse"
+        ALL_MARKET.update(market)
+        groups = {}
+        for code, name in ind.items():
+            if code in market:
+                groups.setdefault(name, []).append(code)
+        if len(groups) < 10:
+            raise RuntimeError(f"產業太少（{len(groups)}）")
+        secs = sorted(groups.items(), key=lambda kv: -len(kv[1]))
+        SECTORS = [(n, "f" if n.startswith("金融") else ("e" if n in ELEC else "t"), " ".join(sorted(cs))) for n, cs in secs]
+        NAMES = [x[0] for x in SECTORS]
+        SEC_OF = {c: i for i, x in enumerate(SECTORS) for c in x[2].split()}
+        CODES = list(SEC_OF)
+        MARKET.update({c: market[c] for c in CODES})
+        log(f"全市場清單：{len(SECTORS)} 個產業、{len(CODES)} 檔")
+        return True
+    except Exception as e:  # noqa: BLE001
+        log("全市場清單失敗：", type(e).__name__, str(e)[:200])
+        return False
+
+
 def fetch(ex_list):
     """ex_list: ['tse_2330.tw', ...]；回傳有資料的 msgArray。"""
     if not session.cookies:
@@ -271,7 +317,7 @@ def fetch(ex_list):
             except Exception as e:  # noqa: BLE001
                 log("抓取失敗", type(e).__name__, str(e)[:120])
                 time.sleep(3)
-        time.sleep(1.2)
+        time.sleep(1.2)   # 每批間隔 1.2 秒，不要抓太兇
     return out
 
 
@@ -598,11 +644,16 @@ def main():
     if other_writer_active():
         log("另一個記錄器正在記錄，這次不重複")
         return
-    prev, _ = gh_get_today() if (API_TOKEN or not os.path.isdir(DATA_DIR)) else (None, None)
-    if os.path.isdir(DATA_DIR):
-        build_universe()
+    prev, _ = gh_get_today()
+    today = datetime.now(TW).strftime("%Y-%m-%d")
+    if prev and prev.get("date") == today and universe_from_payload(prev):
+        pass                                   # 盤中重啟：沿用今天的清單接著記
+    elif FULL and build_universe_full():
+        pass                                   # 全部上市櫃普通股
+    elif os.path.isdir(DATA_DIR):
+        build_universe()                       # 備援：各產業前 20 名
     elif not (prev and universe_from_payload(prev)):
-        log("沒有 data 分支也沒有上次清單，改用備用清單")
+        log("沒有任何清單，改用內建備用清單")
     load_themes()
     EXTRA_SET.update(EXTRA)
     rec, pusher = Recorder(), Pusher()
@@ -629,7 +680,7 @@ def main():
             pusher.push(rec.payload())
             last_push = time.time()
             log(f"已存檔 m={rec.hist[-1]['m']} 涵蓋 {rec.covered} 檔 全市場 {sum(rec.nets)/1e8:+.2f} 億")
-        time.sleep(max(1, POLL_SEC - (time.time() - t0)))
+        time.sleep(max(1, (60 if len(CODES) > 900 else POLL_SEC) - (time.time() - t0)))   # 全市場一輪 60 秒
     rec.step()
     pusher.push(rec.payload())
     log("收盤，完成")

@@ -1056,6 +1056,34 @@ def _tx_daily(months):
     return [bars[k] for k in sorted(bars)]
 
 
+def _yahoo_bars(ysym, rng, interval):
+    """Yahoo Finance 圖表資料（備援來源）：^TWII 加權、^TWOII 櫃買。"""
+    def go():
+        r = _session.get(f"https://query1.finance.yahoo.com/v8/finance/chart/{ysym}",
+                         params={"range": rng, "interval": interval, "includePrePost": "false"},
+                         headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36"},
+                         timeout=20)
+        r.raise_for_status()
+        return r.json()
+    js = _cached(f"yh:{ysym}:{rng}:{interval}", 60 if interval != "1d" else 900, go)
+    res = ((js.get("chart") or {}).get("result") or [None])[0]
+    if not res:
+        _kdbg(f"yahoo {ysym}: {(js.get('chart') or {}).get('error')}")
+        return []
+    ts = res.get("timestamp") or []
+    q = ((res.get("indicators") or {}).get("quote") or [{}])[0]
+    out = []
+    for i, t in enumerate(ts):
+        o, h, l, c = (q.get(k, [None] * len(ts))[i] for k in ("open", "high", "low", "close"))
+        v = (q.get("volume") or [None] * len(ts))[i]
+        if not (o and h and l and c):
+            continue
+        dt = datetime.fromtimestamp(t, TW_TZ)
+        key = dt.strftime("%Y-%m-%d") if interval == "1d" else dt.hour * 60 + dt.minute - 540 + 1
+        out.append([key, round(o, 2), round(h, 2), round(l, 2), round(c, 2), None])   # Yahoo 指數量不可靠，不放
+    return out
+
+
 @mcp.tool()
 def get_kline(symbol: str = "TAIEX", period: str = "day", months: int = 6, date: str = "") -> dict:
     """K 線資料。symbol：TAIEX（加權）、TPEX（櫃買）、TX（台指期近月日盤）。
@@ -1066,15 +1094,29 @@ def get_kline(symbol: str = "TAIEX", period: str = "day", months: int = 6, date:
     _KDEBUG.clear()
     try:
         if period == "minute":
-            if sym != "TAIEX":
-                return {"symbol": sym, "period": period, "bars": [], "error": "分 K 目前只支援 TAIEX，其他請用雲端記錄的走勢"}
-            b = _taiex_minute(date)
+            if sym not in ("TAIEX", "TPEX"):
+                return {"symbol": sym, "period": period, "bars": [], "error": "分 K 只支援 TAIEX、TPEX，台指期請用雲端記錄的走勢"}
+            b = []
+            if sym == "TAIEX":
+                try:
+                    b = _taiex_minute(date)
+                except Exception as e:  # noqa: BLE001
+                    _kdbg(f"twse minute: {e}")
+            if not b:
+                b = _yahoo_bars("^TWII" if sym == "TAIEX" else "^TWOII", "1d", "1m")
+                return {"symbol": sym, "period": period, "unit": None, "source": "yahoo", "bars": b, "debug": _KDEBUG[:8]}
             return {"symbol": sym, "period": period, "unit": "億元", "bars": b, "debug": _KDEBUG[:8]}
         if sym == "TAIEX":
             b = _taiex_daily(months)
+            if len(b) < 5:      # 證交所擋或沒資料 → 改用 Yahoo
+                b = _yahoo_bars("^TWII", f"{max(1, (months + 11) // 12)}y" if months > 12 else f"{months}mo", "1d")
+                return {"symbol": sym, "period": "day", "unit": None, "source": "yahoo", "bars": b, "debug": _KDEBUG[:8]}
             return {"symbol": sym, "period": "day", "unit": "億元", "bars": b, "debug": _KDEBUG[:8]}
         if sym == "TPEX":
             b = _tpex_daily(months)
+            if len(b) < 5:
+                b = _yahoo_bars("^TWOII", f"{max(1, (months + 11) // 12)}y" if months > 12 else f"{months}mo", "1d")
+                return {"symbol": sym, "period": "day", "unit": None, "source": "yahoo", "bars": b, "debug": _KDEBUG[:8]}
             return {"symbol": sym, "period": "day", "unit": None, "bars": b, "debug": _KDEBUG[:8]}
         if sym == "TX":
             b = _tx_daily(months)
