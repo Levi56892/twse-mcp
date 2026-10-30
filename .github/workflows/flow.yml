@@ -1,6 +1,6 @@
 name: 記錄盤中資金流
 
-# 自動記錄已改由 Render 伺服器負責（每個交易日 08:45 自己啟動）。
+# 自動記錄已改由 Render 伺服器負責（每個交易日 08:57 自己啟動）。
 # 這裡只保留手動啟動當備援：到 Actions 按 Run workflow 即可。
 on:
   workflow_dispatch:
