@@ -1,6 +1,6 @@
 """
 盤中資金流記錄器（給「即時資金流」頁面用）
-由 GitHub Actions 在交易日 08:35 啟動，記錄 09:00–13:30 各產業的主動買賣淨額，
+由 Render 伺服器在交易日 08:57 啟動（GitHub Actions 只留手動備援），記錄 09:00–13:30 各產業的主動買賣淨額，
 每分鐘把當天結果存到 flow 分支的 today.json（只保留當天，隔天自動覆蓋）。
 
 外／內盤判斷（證交所 mis 即時資料，每 15 秒一次）：
@@ -295,6 +295,17 @@ def build_universe_full():
     except Exception as e:  # noqa: BLE001
         log("全市場清單失敗：", type(e).__name__, str(e)[:200])
         return False
+
+
+def build_universe_full_retry(tries=5, wait=30):
+    """證交所資料源偶爾會擋或逾時：失敗就隔 30 秒再試，最多 5 次，才退回小清單。"""
+    for k in range(tries):
+        if build_universe_full():
+            return True
+        if k < tries - 1:
+            log(f"{wait} 秒後重試全市場清單（第 {k + 2}/{tries} 次）")
+            time.sleep(wait)
+    return False
 
 
 def fetch(ex_list):
@@ -653,7 +664,7 @@ def main():
         return
     prev, _ = gh_get_today()
     today = datetime.now(TW).strftime("%Y-%m-%d")
-    if FULL and build_universe_full():
+    if FULL and build_universe_full_retry():
         pass                                   # 全部上市櫃普通股（盤中重啟也用全市場，不退回今天較小的清單）
     elif prev and prev.get("date") == today and universe_from_payload(prev):
         pass                                   # 盤中重啟：沿用今天的清單接著記
@@ -666,8 +677,9 @@ def main():
     rec, pusher = Recorder(), Pusher()
     if prev and prev.get("date") == datetime.now(TW).strftime("%Y-%m-%d") and prev.get("hist"):
         resume(rec, prev)
-    while now_min() < START - 1.5:
-        time.sleep(20)
+    # 08:57:30 開始抓：全市場一輪約 2 分鐘，9:00 開盤前每檔都先看過一次（成交量 0），開盤那筆集合競價才能照開高／開低直接算
+    while now_min() < START - 2.5:
+        time.sleep(5)
     rec.resolve_markets()
     if not rec.ex:
         log("抓不到任何報價，結束")

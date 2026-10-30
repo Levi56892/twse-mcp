@@ -1167,7 +1167,7 @@ def _rec_run():
 
 def _rec_should_run(now):
     hm = now.hour * 100 + now.minute
-    return now.weekday() < 5 and 845 <= hm < 1332
+    return now.weekday() < 5 and 857 <= hm < 1332   # 8:57 才啟動：太早啟動證交所資料源容易擋或逾時
 
 
 def _rec_start(force=False):
@@ -1189,7 +1189,7 @@ def _rec_start(force=False):
 
 
 def _scheduler():
-    """每分鐘檢查一次：交易日 08:45～13:32 之間沒在記錄就啟動；記錄中每 5 分鐘戳自己一下，避免 Render 休眠。"""
+    """每分鐘檢查一次：交易日 08:57～13:32 之間沒在記錄就啟動；記錄中每 5 分鐘戳自己一下，避免 Render 休眠。"""
     self_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
     n = 0
     while True:
@@ -1209,7 +1209,7 @@ def _scheduler():
 
 @mcp.tool()
 def start_recorder(force: bool = False) -> dict:
-    """喚醒伺服器並啟動「盤中資金流記錄器」（交易日 08:45～13:32 有效；force=true 可在其他時間手動啟動）。
+    """喚醒伺服器並啟動「盤中資金流記錄器」（交易日 08:57～13:32 有效；force=true 可在其他時間手動啟動）。
     回傳：result（started / already_running / outside_hours / done_today / no_token）、status、day、started。"""
     r = _rec_start(force=force)
     return {"result": r, "status": _rec["status"], "day": _rec["day"], "started": _rec["started"]}
