@@ -1,0 +1,5 @@
+date,open,high,low,close,volume_lots,foreign_lots,trust_lots,dealer_lots,total_lots,margin_lots,short_lots,sbl_lots,foreign_hold_lots,foreign_hold_pct
+2024-12-26,204,212.5,201,206.5,820,18,0,-2,16,,,,153,0.47
+2024-12-27,203.5,206.5,202,204,330,-27,0,-1,-28,,,,126,0.39
+2024-12-30,202.5,224,202.5,221,569,89,0,0,89,,,,215,0.66
+2024-12-31,215,220.5,215,218,288,8,0,0,8,,,,223,0.69

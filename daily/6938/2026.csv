@@ -1,0 +1,5 @@
+date,open,high,low,close,volume_lots,foreign_lots,trust_lots,dealer_lots,total_lots,margin_lots,short_lots,sbl_lots,foreign_hold_lots,foreign_hold_pct,margin_buy_lots,margin_sell_lots,margin_repay_lots
+2026-10-27,73.7,80,71,79.9,554,,,,,,,,2,0.01,,,
+2026-10-28,80.1,88.8,80,83,658,80,0,0,80,,,,82,0.56,,,
+2026-10-29,80.1,81,76.7,79.2,240,21,0,0,21,,,,103,0.7,,,
+2026-10-30,78,80,77,80,74,-5,0,0,-5,,,,98,0.67,,,

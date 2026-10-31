@@ -1,0 +1,3 @@
+date,open,high,low,close,volume_lots,foreign_lots,trust_lots,dealer_lots,total_lots,margin_lots,short_lots,sbl_lots,foreign_hold_lots,foreign_hold_pct,margin_buy_lots,margin_sell_lots,margin_repay_lots
+2021-01-04,,,,,,,,,,62211,0,0,173941,15.97,0,0,13
+2021-01-05,,,,,,,,,,62193,0,,173941,15.97,0,0,18

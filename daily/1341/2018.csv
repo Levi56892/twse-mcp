@@ -1,0 +1,6 @@
+date,open,high,low,close,volume_lots,foreign_lots,trust_lots,dealer_lots,total_lots,margin_lots,short_lots,sbl_lots,foreign_hold_lots,foreign_hold_pct,margin_buy_lots,margin_sell_lots,margin_repay_lots
+2018-12-24,58.1,68,58.1,64.6,1152,,,,,,,,42878,86.79,,,
+2018-12-25,58,63.6,56,61,460,,,,,,,,42878,86.79,,,
+2018-12-26,60.2,60.2,52.5,55,294,,,,,,,,42878,86.79,,,
+2018-12-27,54.6,55,47.1,51,233,,,,,,,,42878,86.79,,,
+2018-12-28,50.2,52.5,47.25,52.4,256,1,0,0,1,,,,42879,86.79,,,
