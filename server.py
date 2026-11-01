@@ -625,13 +625,15 @@ PEEK = {
 
 # ---------- 盤中資金流（flow_recorder.py 由 GitHub Actions 每分鐘更新） ----------
 FLOW_REPO = os.environ.get("FLOW_REPO", "Levi56892/twse-mcp")
-FLOW_TTL = int(os.environ.get("FLOW_TTL", "75"))   # 未登入的 GitHub API 每小時 60 次，75 秒快取剛好在額度內
+# 讀 GitHub 用的金鑰：有金鑰每小時 5,000 次，快取 20 秒（配合記錄器每 30 秒一輪）；沒有金鑰每小時只有 60 次，只能快取 75 秒
+GH_READ_TOKEN = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_WRITE_TOKEN")
+FLOW_TTL = int(os.environ.get("FLOW_TTL") or (20 if GH_READ_TOKEN else 75))
 
 
 def _fetch_flow():
     # 先走 GitHub API（沒有 CDN 快取，最即時）；被限流時改走 raw（最多約 5 分鐘延遲）
     headers = {"Accept": "application/vnd.github.raw+json"}
-    tok = os.environ.get("GITHUB_TOKEN")
+    tok = GH_READ_TOKEN
     if tok:
         headers["Authorization"] = f"Bearer {tok}"
     try:
@@ -759,7 +761,7 @@ def get_index_intraday(date: str = "") -> dict:
 # ---------- 台指期夜盤走勢（night_recorder.py 由 GitHub Actions 每分鐘更新） ----------
 def _fetch_night():
     headers = {"Accept": "application/vnd.github.raw+json"}
-    tok = os.environ.get("GITHUB_TOKEN")
+    tok = GH_READ_TOKEN
     if tok:
         headers["Authorization"] = f"Bearer {tok}"
     r = _session.get(f"https://api.github.com/repos/{FLOW_REPO}/contents/night.json",
@@ -788,7 +790,7 @@ FINNHUB_KEY = os.environ.get("FINNHUB_API_KEY", "").strip()
 
 def _fetch_us():
     headers = {"Accept": "application/vnd.github.raw+json"}
-    tok = os.environ.get("GITHUB_TOKEN")
+    tok = GH_READ_TOKEN
     if tok:
         headers["Authorization"] = f"Bearer {tok}"
     try:

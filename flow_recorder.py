@@ -3,7 +3,7 @@
 由 Render 伺服器在交易日 08:57 啟動（GitHub Actions 只留手動備援），記錄 09:00–13:30 各產業的主動買賣淨額，
 每分鐘把當天結果存到 flow 分支的 today.json（只保留當天，隔天自動覆蓋）。
 
-外／內盤判斷（證交所 mis 即時資料，每 15 秒一次）：
+外／內盤判斷（證交所 mis 即時資料，全部上市櫃普通股每 30 秒一輪）：
   成交價 >= 上一次的最佳賣價 → 外盤（主動買）
   成交價 <= 上一次的最佳買價 → 內盤（主動賣）
   介於中間 → 看價格升降；價格不變沿用上一次方向
@@ -14,7 +14,9 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -308,29 +310,55 @@ def build_universe_full_retry(tries=5, wait=30):
     return False
 
 
-def fetch(ex_list):
-    """ex_list: ['tse_2330.tw', ...]；回傳有資料的 msgArray。"""
-    if not session.cookies:
+BATCH = 150       # 每次查 150 檔（實測上限：150 正常，200 起證交所回空或拒絕）
+WORKERS = 3       # 同時送 3 個請求（全市場 1,975 檔＝14 次請求，盤中一輪約 10–15 秒）；不要再開更多，以免被證交所擋
+_tl = threading.local()
+_gen = [0]        # 連線世代：整輪都沒資料時加 1，讓每條線重新取得證交所 cookie
+_pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="mis")   # 整天共用，連線（cookie）不用每輪重建
+
+
+def _mis_session():
+    s = getattr(_tl, "s", None)
+    if s is None or getattr(_tl, "gen", -1) != _gen[0]:
+        s = requests.Session()
+        s.headers.update(session.headers)
         try:
-            session.get("https://mis.twse.com.tw/stock/index.jsp", timeout=10)
+            s.get("https://mis.twse.com.tw/stock/index.jsp", timeout=10)
         except requests.RequestException:
             pass
+        _tl.s, _tl.gen = s, _gen[0]
+    return s
+
+
+def _fetch_part(part):
+    s = _mis_session()
+    for attempt in range(2):
+        try:
+            r = s.get(MIS, params={"ex_ch": part, "json": 1, "delay": 0,
+                                   "_": int(time.time() * 1000)}, timeout=10)
+            r.raise_for_status()
+            rows = [m for m in r.json().get("msgArray", []) if m.get("c")]
+            time.sleep(0.3)   # 每條線每次間隔 0.3 秒，不要抓太兇
+            return rows
+        except Exception as e:  # noqa: BLE001
+            log("抓取失敗", type(e).__name__, str(e)[:120])
+            time.sleep(3)
+    return []
+
+
+def fetch(ex_list):
+    """ex_list: ['tse_2330.tw', ...]；回傳有資料的 msgArray。每次查 150 檔、同時 3 個請求。"""
+    parts = ["|".join(ex_list[i:i + BATCH]) for i in range(0, len(ex_list), BATCH)]
+    if not parts:
+        return []
     out = []
-    for i in range(0, len(ex_list), 50):
-        part = "|".join(ex_list[i:i + 50])
-        for attempt in range(2):
-            try:
-                r = session.get(MIS, params={"ex_ch": part, "json": 1, "delay": 0,
-                                             "_": int(time.time() * 1000)}, timeout=10)
-                r.raise_for_status()
-                out += [m for m in r.json().get("msgArray", []) if m.get("c")]
-                break
-            except Exception as e:  # noqa: BLE001
-                log("抓取失敗", type(e).__name__, str(e)[:120])
-                time.sleep(3)
-        time.sleep(1.2)   # 每批間隔 1.2 秒，不要抓太兇
-    if not out and ex_list:
-        session.cookies.clear()   # 整輪都沒資料：通常是證交所連線過期，下一輪重新取得
+    if len(parts) == 1:
+        out = _fetch_part(parts[0])
+    else:
+        for rows in _pool.map(_fetch_part, parts):
+            out += rows
+    if not out:
+        _gen[0] += 1   # 整輪都沒資料：通常是證交所連線過期，下一輪重新取得
     return out
 
 
@@ -411,7 +439,7 @@ class Recorder:
             log("台指期抓取失敗", type(e).__name__, str(e)[:100])
 
     def step(self):
-        # 大盤先單獨抓：不受全市場一輪 30 多批的影響，任何一批失敗都不會讓指數斷掉
+        # 大盤先單獨抓：不受全市場一輪 20 批的影響，任何一批失敗都不會讓指數斷掉
         self.step_index(fetch(["tse_t00.tw", "otc_o00.tw"]))
         rows = fetch(self.ex)
         tick = [0.0] * len(SECTORS)
@@ -677,7 +705,7 @@ def main():
     rec, pusher = Recorder(), Pusher()
     if prev and prev.get("date") == datetime.now(TW).strftime("%Y-%m-%d") and prev.get("hist"):
         resume(rec, prev)
-    # 08:57:30 開始抓：全市場一輪約 2 分鐘，9:00 開盤前每檔都先看過一次（成交量 0），開盤那筆集合競價才能照開高／開低直接算
+    # 08:57:30 開始抓：全市場一輪約 15–20 秒（證交所慢的時候會更久），9:00 開盤前每檔都先看過一次（成交量 0），開盤那筆集合競價才能照開高／開低直接算
     while now_min() < START - 2.5:
         time.sleep(5)
     rec.resolve_markets()
@@ -699,9 +727,10 @@ def main():
             pusher.push(rec.payload())
             last_push = time.time()
             log(f"已存檔 m={rec.hist[-1]['m']} 涵蓋 {rec.covered} 檔 全市場 {sum(rec.nets)/1e8:+.2f} 億")
-        time.sleep(max(1, (60 if len(CODES) > 900 else POLL_SEC) - (time.time() - t0)))   # 全市場一輪 60 秒
+        time.sleep(max(1, POLL_SEC - (time.time() - t0)))   # 每 30 秒一輪（全市場一輪抓取約 15–20 秒）
     rec.step()
     pusher.push(rec.payload())
+    _pool.shutdown(wait=False)
     log("收盤，完成")
 
 
