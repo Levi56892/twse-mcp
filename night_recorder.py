@@ -1,7 +1,8 @@
 """
 台指期夜盤記錄器（給「台股戰情室」用）
-夜盤 15:00 到隔天 05:00，共 14 小時；GitHub Actions 一次最多跑 6 小時，
-所以排了三段（14:55、20:50、02:45 啟動），每段開始時先讀回 night 分支上已記錄的部分再接著記。
+夜盤 15:00 到隔天 05:00，共 14 小時。由 Render 伺服器在交易日 14:58 啟動、一路記到 05:00
+（GitHub Actions 排程常延遲幾十分鐘，只留手動備援；Actions 一次最多 6 小時，手動時會分段接力）。
+每次啟動先讀回 night 分支上已記錄的部分再接著記。
 每 30 秒抓一次期交所夜盤報價，每分鐘存到 night 分支的 night.json（只保留最新一個夜盤）。
 
 時間座標：距「夜盤所屬交易日 09:00」的分鐘數，15:00＝360，午夜＝900，05:00＝1200，
@@ -19,10 +20,13 @@ TW = timezone(timedelta(hours=8))
 URL = "https://mis.taifex.com.tw/futures/api/getQuoteList"
 POLL_SEC = 30
 PUSH_SEC = 60
-MAX_RUN_SEC = 5 * 3600 + 50 * 60      # 每段最多 5 小時 50 分
 OUT_DIR = os.environ.get("NIGHT_DIR", "nightout")
 REPO = os.environ.get("GITHUB_REPOSITORY", "")
 TOKEN = os.environ.get("GH_TOKEN", "")
+API_TOKEN = os.environ.get("GH_WRITE_TOKEN", "")        # Render 用：可寫入 repo 的金鑰（走 GitHub API，不需要 git）
+API_REPO = os.environ.get("FLOW_REPO", REPO or "Levi56892/twse-mcp")
+# GitHub Actions 每段最多 5 小時 50 分；Render 沒有限制，一路記到 05:00
+MAX_RUN_SEC = 15 * 3600 if API_TOKEN else 5 * 3600 + 50 * 60
 
 session = requests.Session()
 session.headers.update({"User-Agent": "Mozilla/5.0 (twse-night-recorder)", "Referer": "https://mis.taifex.com.tw/futures/"})
@@ -76,6 +80,47 @@ def fetch_night():
     return max(ql, key=lambda q: num(q.get("CTotalVolume")) or 0)
 
 
+class ApiStore:
+    """Render 模式：用 GitHub API 讀寫 night 分支的 night.json。"""
+
+    def __init__(self):
+        self.url = f"https://api.github.com/repos/{API_REPO}/contents/night.json"
+        self.h = {"Authorization": f"Bearer {API_TOKEN}", "Accept": "application/vnd.github+json"}
+        self.prev, self.sha = None, None
+        self.load()
+        log("用 GitHub API 存檔（Render 模式）")
+
+    def load(self):
+        import base64
+        try:
+            r = session.get(self.url, params={"ref": "night"}, headers=self.h, timeout=20)
+            if r.status_code == 200:
+                js = r.json()
+                self.sha = js.get("sha")
+                self.prev = json.loads(base64.b64decode(js["content"]).decode("utf-8"))
+        except Exception as e:  # noqa: BLE001
+            log("讀取 night.json 失敗", type(e).__name__, str(e)[:100])
+
+    def save(self, data):
+        import base64
+        body = {"message": f"夜盤 {data['session']} {data['updated']}", "branch": "night",
+                "content": base64.b64encode(json.dumps(data, ensure_ascii=False, separators=(",", ":")).encode("utf-8")).decode()}
+        for _ in range(2):
+            if self.sha:
+                body["sha"] = self.sha
+            try:
+                r = session.put(self.url, json=body, headers=self.h, timeout=30)
+            except requests.RequestException as e:
+                log("推送失敗", type(e).__name__)
+                return
+            if r.status_code in (200, 201):
+                self.sha = r.json().get("content", {}).get("sha")
+                return
+            log("推送失敗", r.status_code, r.text[:150])
+            self.sha = None
+            self.load()   # sha 過期：重新取得再試一次（只更新 sha，不動已記錄的資料）
+
+
 class Store:
     def __init__(self):
         os.makedirs(OUT_DIR, exist_ok=True)
@@ -119,7 +164,7 @@ def main():
         log("不在夜盤時段，結束")
         return
     sdate = session_date(now)
-    store = Store()
+    store = ApiStore() if API_TOKEN else Store()
     data = store.prev if (store.prev and store.prev.get("session") == sdate) else \
         {"session": sdate, "symbol": None, "ref": None, "tx": [], "updated": ""}
     log(f"夜盤 {sdate}，已有 {len(data['tx'])} 點")

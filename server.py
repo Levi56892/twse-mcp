@@ -772,7 +772,7 @@ def _fetch_night():
 
 @mcp.tool()
 def get_night_futures() -> dict:
-    """台指期夜盤（15:00～隔天 05:00）的盤中走勢，由 GitHub Actions 每 30 秒記錄、每分鐘存檔。
+    """台指期夜盤（15:00～隔天 05:00）的盤中走勢，由 Render 伺服器（14:58 自動啟動）每 30 秒記錄、每分鐘存檔。
     回傳：session（夜盤所屬交易日）、symbol、ref、updated、
     tx:[[距該交易日 09:00 的分鐘數, 價格], ...]（15:00＝360，午夜＝900，05:00＝1200）。"""
     try:
@@ -1188,14 +1188,64 @@ def _rec_start(force=False):
     return "started"
 
 
+# ---------- 台指期夜盤記錄器（同樣在 Render 上自己跑；GitHub 排程常延遲幾十分鐘，會漏掉 15:00 開盤那段） ----------
+_night = {"thread": None, "session": None, "status": "idle", "started": None}
+
+
+def _night_session(now):
+    """夜盤屬於開盤那天：中午以後算今天，凌晨算前一天。"""
+    return (now if now.hour >= 12 else now - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def _night_should_run(now):
+    hm, wd = now.hour * 100 + now.minute, now.weekday()
+    return (wd < 5 and hm >= 1458) or (1 <= wd <= 5 and hm <= 504)   # 週一～五 14:58 起，到隔天 05:04
+
+
+def _night_run():
+    import importlib
+    try:
+        import night_recorder as nr
+        nr = importlib.reload(nr)
+        _night["status"] = "recording"
+        nr.main()
+        _night["status"] = "done"
+    except BaseException as e:  # noqa: BLE001
+        _night["status"] = f"error: {type(e).__name__}: {e}"
+
+
+def _night_start():
+    now = datetime.now(TW_TZ)
+    sess = _night_session(now)
+    t = _night["thread"]
+    if t and t.is_alive():
+        return "already_running"
+    if not os.environ.get("GH_WRITE_TOKEN"):
+        return "no_token"
+    if not _night_should_run(now):
+        return "outside_hours"
+    if _night["session"] == sess and _night["status"] == "done":
+        return "done"
+    _night.update(session=sess, started=now.strftime("%H:%M:%S"), status="starting")
+    _night["thread"] = threading.Thread(target=_night_run, name="night-recorder", daemon=True)
+    _night["thread"].start()
+    return "started"
+
+
 def _scheduler():
-    """每分鐘檢查一次：交易日 08:57～13:32 之間沒在記錄就啟動；記錄中每 5 分鐘戳自己一下，避免 Render 休眠。"""
+    """每分鐘檢查一次：交易日 08:57～13:32（資金流）、14:58～隔天 05:04（夜盤）之間沒在記錄就啟動；
+    記錄中每 5 分鐘戳自己一下，避免 Render 休眠。"""
     self_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
     n = 0
     while True:
         try:
-            if _rec_should_run(datetime.now(TW_TZ)):
+            now = datetime.now(TW_TZ)
+            day, night = _rec_should_run(now), _night_should_run(now)
+            if day:
                 _rec_start()
+            if night:
+                _night_start()
+            if day or night:
                 n += 1
                 if self_url and n % 5 == 0:
                     try:
@@ -1212,7 +1262,8 @@ def start_recorder(force: bool = False) -> dict:
     """喚醒伺服器並啟動「盤中資金流記錄器」（交易日 08:57～13:32 有效；force=true 可在其他時間手動啟動）。
     回傳：result（started / already_running / outside_hours / done_today / no_token）、status、day、started。"""
     r = _rec_start(force=force)
-    return {"result": r, "status": _rec["status"], "day": _rec["day"], "started": _rec["started"]}
+    return {"result": r, "status": _rec["status"], "day": _rec["day"], "started": _rec["started"],
+            "night": {k: _night[k] for k in ("session", "status", "started")}}
 
 
 threading.Thread(target=_scheduler, name="rec-scheduler", daemon=True).start()
