@@ -1268,6 +1268,14 @@ def start_recorder(force: bool = False) -> dict:
             "night": {k: _night[k] for k in ("session", "status", "started")}}
 
 
+# 網頁 APP 用的資料出口（web_api.py）：載入失敗也不影響連接器和記錄器
+try:
+    import web_api
+    web_api.register(mcp, globals())
+except Exception as _e:  # noqa: BLE001
+    print("網頁資料出口沒有啟用：", type(_e).__name__, _e, flush=True)
+
+
 threading.Thread(target=_scheduler, name="rec-scheduler", daemon=True).start()
 
 
