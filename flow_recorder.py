@@ -12,6 +12,7 @@
 """
 import json
 import os
+import random
 import subprocess
 import sys
 import threading
@@ -348,7 +349,13 @@ def _fetch_part(part):
 
 
 def fetch(ex_list):
-    """ex_list: ['tse_2330.tw', ...]；回傳有資料的 msgArray。每次查 150 檔、同時 3 個請求。"""
+    """ex_list: ['tse_2330.tw', ...]；回傳有資料的 msgArray。每次查 150 檔、同時 3 個請求。
+    證交所會依「查詢的股票清單＋順序」快取 1–2 分鐘，同樣的清單再查只會拿到舊資料：
+    所以每輪都把順序打亂；清單很短（例如只查大盤）時另外夾帶 2 檔隨機股票，讓每次查詢都不一樣。"""
+    ex_list = list(ex_list)
+    if len(ex_list) <= 5 and CODES:
+        ex_list += [f"{MARKET.get(c) or ALL_MARKET.get(c, 'tse')}_{c}.tw" for c in random.sample(CODES, min(2, len(CODES)))]
+    random.shuffle(ex_list)
     parts = ["|".join(ex_list[i:i + BATCH]) for i in range(0, len(ex_list), BATCH)]
     if not parts:
         return []
