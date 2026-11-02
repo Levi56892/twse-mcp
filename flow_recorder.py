@@ -15,16 +15,14 @@ import os
 import random
 import subprocess
 import sys
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 
 import requests
 
 TW = timezone(timedelta(hours=8))
 MIS = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
-POLL_SEC = 30
+POLL_SEC = 60     # 每 60 秒一輪（30 秒＋同時 3 個請求會被證交所封鎖）
 FULL = os.environ.get("FULL_UNIVERSE", "1") == "1"   # 1＝全部上市櫃普通股；0＝各產業前 20 名
 TOP_N = int(os.environ.get("TOP_N", "20"))   # 每個產業取近 20 日成交金額前 N 名
 DATA_DIR = os.environ.get("DATA_DIR", "databr")  # data 分支（含每日成交量）
@@ -312,62 +310,51 @@ def build_universe_full_retry(tries=5, wait=30):
 
 
 BATCH = 150       # 每次查 150 檔（實測上限：150 正常，200 起證交所回空或拒絕）
-WORKERS = 3       # 同時送 3 個請求（全市場 1,975 檔＝14 次請求，盤中一輪約 10–15 秒）；不要再開更多，以免被證交所擋
-_tl = threading.local()
-_gen = [0]        # 連線世代：整輪都沒資料時加 1，讓每條線重新取得證交所 cookie
-_pool = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix="mis")   # 整天共用，連線（cookie）不用每輪重建
-
-
-def _mis_session():
-    s = getattr(_tl, "s", None)
-    if s is None or getattr(_tl, "gen", -1) != _gen[0]:
-        s = requests.Session()
-        s.headers.update(session.headers)
-        try:
-            s.get("https://mis.twse.com.tw/stock/index.jsp", timeout=10)
-        except requests.RequestException:
-            pass
-        _tl.s, _tl.gen = s, _gen[0]
-    return s
+GAP = 0.5         # 一次只送一個請求，每次間隔 0.5 秒
+# 2026-11-02 教訓：同時 3 個請求、每 30 秒一輪、每次都避開快取，跑 1.5 小時後 Render 被證交所封鎖（連線直接被切斷）。
+# 現在改成一次一個、每 60 秒一輪，再加上被擋時自動放慢的煞車（見 main）。
 
 
 def _fetch_part(part):
-    s = _mis_session()
-    for attempt in range(2):
-        try:
-            # Render 在海外，盤中每次要 5–15 秒；等待上限 20 秒（10 秒常逾時，整批就沒資料）
-            r = s.get(MIS, params={"ex_ch": part, "json": 1, "delay": 0,
-                                   "_": int(time.time() * 1000)}, timeout=20)
-            r.raise_for_status()
-            rows = [m for m in r.json().get("msgArray", []) if m.get("c")]
-            time.sleep(0.3)   # 每條線每次間隔 0.3 秒，不要抓太兇
-            return rows
-        except Exception as e:  # noqa: BLE001
-            log("抓取失敗", type(e).__name__, str(e)[:120])
-            time.sleep(3)
-    return []
+    try:
+        # Render 在海外，盤中每次要 5–15 秒；等待上限 20 秒
+        r = session.get(MIS, params={"ex_ch": part, "json": 1, "delay": 0,
+                                     "_": int(time.time() * 1000)}, timeout=20)
+        r.raise_for_status()
+        return [m for m in r.json().get("msgArray", []) if m.get("c")]
+    except Exception as e:  # noqa: BLE001
+        log("抓取失敗", type(e).__name__, str(e)[:120])
+        return None
 
 
 def fetch(ex_list):
-    """ex_list: ['tse_2330.tw', ...]；回傳有資料的 msgArray。每次查 150 檔、同時 3 個請求。
+    """ex_list: ['tse_2330.tw', ...]；回傳有資料的 msgArray。每次查 150 檔、一次一個。
     證交所會依「查詢的股票清單＋順序」快取 1–2 分鐘，同樣的清單再查只會拿到舊資料：
-    所以每輪都把順序打亂；清單很短（例如只查大盤）時另外夾帶 2 檔隨機股票，讓每次查詢都不一樣。"""
+    所以每輪都把順序打亂；清單很短（例如只查大盤）時另外夾帶 2 檔隨機股票，讓每次查詢都不一樣。
+    連續 2 次失敗就停止這一輪（多半是被擋，硬打只會擋更久）。"""
     ex_list = list(ex_list)
     if len(ex_list) <= 5 and CODES:
         ex_list += [f"{MARKET.get(c) or ALL_MARKET.get(c, 'tse')}_{c}.tw" for c in random.sample(CODES, min(2, len(CODES)))]
     random.shuffle(ex_list)
-    parts = ["|".join(ex_list[i:i + BATCH]) for i in range(0, len(ex_list), BATCH)]
-    if not parts:
-        return []
-    out = []
-    if len(parts) == 1:
-        out = _fetch_part(parts[0])
-    else:
-        for rows in _pool.map(_fetch_part, parts):
+    out, fails, ok = [], 0, 0
+    for i in range(0, len(ex_list), BATCH):
+        rows = _fetch_part("|".join(ex_list[i:i + BATCH]))
+        if rows is None:
+            fails += 1
+            if fails >= 2:
+                log("連續 2 次失敗，這一輪先停")
+                break
+        else:
+            fails, ok = 0, ok + 1
             out += rows
+        time.sleep(GAP)
+    LAST_FETCH.update(ok=ok, fail=fails)
     if not out:
-        _gen[0] += 1   # 整輪都沒資料：通常是證交所連線過期，下一輪重新取得
+        session.cookies.clear()   # 整輪都沒資料：下一輪重新連線
     return out
+
+
+LAST_FETCH = {"ok": 1, "fail": 0}   # 最近一次 fetch：成功幾批、最後連續失敗幾次（給 main 的煞車判斷）
 
 
 class Recorder:
@@ -720,7 +707,7 @@ def main():
     if not rec.ex:
         log("抓不到任何報價，結束")
         sys.exit(1)
-    last_push = 0
+    last_push, blocked = 0, 0
     while now_min() < END:
         t0 = time.time()
         try:
@@ -732,14 +719,21 @@ def main():
             log("09:10 仍無成交，判斷為休市，結束")
             return
         took = time.time() - t0
+        # 煞車：一整輪連線都失敗（多半是被證交所擋）→ 等 2、4、8… 分鐘再試，最多 15 分鐘；恢復後回到每 60 秒
+        if LAST_FETCH["ok"] == 0 and LAST_FETCH["fail"] > 0:
+            blocked += 1
+            wait = min(900, 60 * 2 ** blocked)
+            log(f"這輪連線全部失敗（第 {blocked} 次），{wait // 60} 分鐘後再試")
+            time.sleep(wait)
+            continue
+        blocked = 0
         if time.time() - last_push >= PUSH_SEC and rec.hist:
             pusher.push(rec.payload())
             last_push = time.time()
             log(f"已存檔 m={rec.hist[-1]['m']} 這輪 {took:.1f} 秒拿到 {rec.covered} 檔 全市場 {sum(rec.nets)/1e8:+.2f} 億")
-        time.sleep(max(1, POLL_SEC - (time.time() - t0)))   # 每 30 秒一輪（全市場一輪抓取約 15–20 秒）
+        time.sleep(max(1, POLL_SEC - (time.time() - t0)))   # 每 60 秒一輪
     rec.step()
     pusher.push(rec.payload())
-    _pool.shutdown(wait=False)
     log("收盤，完成")
 
 
