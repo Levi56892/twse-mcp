@@ -334,8 +334,9 @@ def _fetch_part(part):
     s = _mis_session()
     for attempt in range(2):
         try:
+            # Render 在海外，盤中每次要 5–15 秒；等待上限 20 秒（10 秒常逾時，整批就沒資料）
             r = s.get(MIS, params={"ex_ch": part, "json": 1, "delay": 0,
-                                   "_": int(time.time() * 1000)}, timeout=10)
+                                   "_": int(time.time() * 1000)}, timeout=20)
             r.raise_for_status()
             rows = [m for m in r.json().get("msgArray", []) if m.get("c")]
             time.sleep(0.3)   # 每條線每次間隔 0.3 秒，不要抓太兇
@@ -723,10 +724,11 @@ def main():
         if now_min() > START + 10 and not rec.open_today and not rec.resumed:
             log("09:10 仍無成交，判斷為休市，結束")
             return
+        took = time.time() - t0
         if time.time() - last_push >= PUSH_SEC and rec.hist:
             pusher.push(rec.payload())
             last_push = time.time()
-            log(f"已存檔 m={rec.hist[-1]['m']} 涵蓋 {rec.covered} 檔 全市場 {sum(rec.nets)/1e8:+.2f} 億")
+            log(f"已存檔 m={rec.hist[-1]['m']} 這輪 {took:.1f} 秒拿到 {rec.covered} 檔 全市場 {sum(rec.nets)/1e8:+.2f} 億")
         time.sleep(max(1, POLL_SEC - (time.time() - t0)))   # 每 30 秒一輪（全市場一輪抓取約 15–20 秒）
     rec.step()
     pusher.push(rec.payload())

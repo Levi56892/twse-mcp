@@ -1160,6 +1160,15 @@ def _rec_run():
         os.environ.setdefault("FLOW_WRITER", "render")
         import flow_recorder as fr
         fr = importlib.reload(fr)          # 每天重新載入，清掉前一天的狀態
+        # 記錄器的訊息也留最近 40 行，start_recorder 會一起回傳（不用進 Render 看 Logs 也能查原因）
+        _rec["log"] = []
+        _orig_log = fr.log
+
+        def _log(*a):
+            _orig_log(*a)
+            _rec["log"] = (_rec["log"] + [datetime.now(TW_TZ).strftime("%H:%M:%S ") + " ".join(str(x) for x in a)])[-40:]
+        fr.log = _log
+        _rec["log"].append(f"FULL_UNIVERSE={os.environ.get('FULL_UNIVERSE', '(未設定，預設 1)')}")
         _rec["status"] = "recording"
         fr.main()
         _rec["status"] = "done"
@@ -1265,6 +1274,7 @@ def start_recorder(force: bool = False) -> dict:
     回傳：result（started / already_running / outside_hours / done_today / no_token）、status、day、started。"""
     r = _rec_start(force=force)
     return {"result": r, "status": _rec["status"], "day": _rec["day"], "started": _rec["started"],
+            "log": _rec.get("log", [])[-20:],
             "night": {k: _night[k] for k in ("session", "status", "started")}}
 
 
