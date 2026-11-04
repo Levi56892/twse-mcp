@@ -12,7 +12,6 @@
 """
 import json
 import os
-import random
 import subprocess
 import sys
 import time
@@ -309,10 +308,13 @@ def build_universe_full_retry(tries=5, wait=30):
     return False
 
 
-BATCH = 150       # 每次查 150 檔（實測上限：150 正常，200 起證交所回空或拒絕）
-GAP = 0.5         # 一次只送一個請求，每次間隔 0.5 秒
-# 2026-11-02 教訓：同時 3 個請求、每 30 秒一輪、每次都避開快取，跑 1.5 小時後 Render 被證交所封鎖（連線直接被切斷）。
-# 現在改成一次一個、每 60 秒一輪，再加上被擋時自動放慢的煞車（見 main）。
+BATCH = 100       # 每次查 100 檔（實測上限 150，留餘裕）
+GAP = 1.0         # 一次只送一個請求，每次間隔 1 秒
+# 教訓：
+#   2026-11-02 每輪打亂順序（避開證交所快取）＋同時 3 個＋每 30 秒 → 1.5 小時後 Render 被封鎖。
+#   2026-11-04 打亂順序＋一次一個＋每 60 秒 → 12 分鐘就被封鎖。
+#   之前好幾週用「固定順序」（吃證交所快取，資料約 1–2 分鐘更新一次）從沒被擋。
+# 所以：查詢順序固定不打亂，讓證交所用快取回應，負擔最輕；更新頻率就跟著證交所快取（約 1–2 分鐘）。
 
 
 def _fetch_part(part):
@@ -328,14 +330,8 @@ def _fetch_part(part):
 
 
 def fetch(ex_list):
-    """ex_list: ['tse_2330.tw', ...]；回傳有資料的 msgArray。每次查 150 檔、一次一個。
-    證交所會依「查詢的股票清單＋順序」快取 1–2 分鐘，同樣的清單再查只會拿到舊資料：
-    所以每輪都把順序打亂；清單很短（例如只查大盤）時另外夾帶 2 檔隨機股票，讓每次查詢都不一樣。
+    """ex_list: ['tse_2330.tw', ...]；回傳有資料的 msgArray。每次查 100 檔、一次一個、順序固定（見上方教訓）。
     連續 2 次失敗就停止這一輪（多半是被擋，硬打只會擋更久）。"""
-    ex_list = list(ex_list)
-    if len(ex_list) <= 5 and CODES:
-        ex_list += [f"{MARKET.get(c) or ALL_MARKET.get(c, 'tse')}_{c}.tw" for c in random.sample(CODES, min(2, len(CODES)))]
-    random.shuffle(ex_list)
     out, fails, ok = [], 0, 0
     for i in range(0, len(ex_list), BATCH):
         rows = _fetch_part("|".join(ex_list[i:i + BATCH]))

@@ -150,19 +150,10 @@ def _pick(data, codes):
 
 
 # ---------- 盤中報價（上市、上櫃） ----------
-_MIS_FILLER = ["2330", "2317", "2454", "2412", "2882", "2881", "1301", "2303", "2308", "3711",
-               "2891", "2886", "1216", "2002", "2603", "2382", "3008", "2357", "1101", "2884"]
-
-
 def _fetch_mis(codes):
-    # 證交所依「查詢清單＋順序」快取 1–2 分鐘，同樣的清單會一直拿到舊報價：
-    # 每次打亂順序，並夾帶 2 檔隨機大型股讓清單每次都不同（回傳時再濾掉）
-    import random
+    # 查詢順序固定（不打亂）：讓證交所用快取回應，負擔最輕。打亂順序避開快取會被證交所封鎖（2026-11-02、11-04 兩次）
     want = set(codes)
-    items = [f"{m}_{c}.tw" for c in codes for m in ("tse", "otc")]
-    items += [f"tse_{c}.tw" for c in random.sample([x for x in _MIS_FILLER if x not in want], 2)]
-    random.shuffle(items)
-    ex_ch = "|".join(items)
+    ex_ch = "|".join(f"{m}_{c}.tw" for c in codes for m in ("tse", "otc"))
     if not _session.cookies:
         try:
             _session.get("https://mis.twse.com.tw/stock/index.jsp", timeout=10)
@@ -171,7 +162,7 @@ def _fetch_mis(codes):
     r = _session.get(MIS_URL, params={"ex_ch": ex_ch, "json": 1, "delay": 0,
                                       "_": int(time.time() * 1000)}, timeout=10)
     r.raise_for_status()
-    # 只留真的有資料的（查不到的那一邊會回空殼），夾帶的股票不回傳
+    # 只留真的有資料的（查不到的那一邊會回空殼）
     return [m for m in r.json().get("msgArray", []) if m.get("c") and m.get("c") in want]
 
 
