@@ -374,6 +374,54 @@ def push_pt(arr, m, v):
         arr.append([m, r2(v, 4)])
 
 
+def split_factor(old, new):
+    """old→new 若像股票分割（1拆n 或 n合1）回傳 old/new 的倍數，否則 None。"""
+    if not old or not new:
+        return None
+    r = old / new
+    n = round(r)
+    if n >= 2 and abs(r - n) < 0.2 * n:               # 容許分割當天再漲跌約 ±20%
+        return n
+    n = round(1 / r)
+    if n >= 2 and abs(1 / r - n) < 0.2 * n:
+        return 1 / n
+    return None
+
+
+def fix_splits(data, quotes):
+    """偵測分割（例：SOXX 2026-11-05 1拆3），把分割前的價格換算成分割後，避免走勢圖出現 +200% 斷崖。"""
+    # 1) 每日收盤／日K：相鄰兩天跳 n 倍 → 前面全部除以 n
+    for key, idx in (("dhist", (1,)), ("dk", (1, 2, 3, 4))):
+        for sym, arr in (data.get(key) or {}).items():
+            if sym == "BTC":
+                continue
+            for i in range(len(arr) - 1, 0, -1):
+                f = split_factor(arr[i - 1][idx[-1]], arr[i][idx[-1]])
+                if f:
+                    for row in arr[:i]:
+                        for j in idx:
+                            row[j] = r2(row[j] / f, 4)
+                    log(f"{key} {sym} 偵測到分割 ×{f:g}，已換算 {i} 筆")
+    # 2) 當天走勢：盤前點位和開盤後的昨收差 n 倍 → 除以 n
+    for sym, arr in (data.get("series") or {}).items():
+        pc = (quotes.get(sym) or {}).get("pc")
+        if not pc or sym == "BTC":
+            continue
+        n = 0
+        for pt in arr:
+            f = split_factor(pt[1], pc)
+            if f:
+                pt[1] = r2(pt[1] / f, 4)
+                n += 1
+        if n:
+            log(f"走勢 {sym} 偵測到分割，已換算 {n} 點")
+    # 3) 一個月小線圖（從 dhist 來的）重新取
+    for sym in DAILY_KEEP:
+        if sym in (data.get("month") or {}) and sym in (data.get("dhist") or {}) and len(data["dhist"][sym]) >= 3:
+            if sym not in [s for s, _ in MONTH_FRED]:
+                data["month"][sym] = data["dhist"][sym][-23:]
+
+
 def main():
     if not KEY:
         log("還沒設定 FINNHUB_API_KEY：到 Settings → Secrets and variables → Actions 新增")
@@ -527,6 +575,7 @@ def main():
         data["updated"] = now.strftime("%H:%M:%S")
         data["updated_ts"] = int(time.time())
         data["trades_seen"] = ws_count
+        fix_splits(data, quotes)
         store.save(data)
         log(f"m={m:.1f} 逐筆 {ws_count} 筆，報價 {len(quotes)} 檔")
 
