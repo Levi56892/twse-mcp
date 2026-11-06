@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -308,16 +309,31 @@ def build_universe_full_retry(tries=5, wait=30):
     return False
 
 
-BATCH = 100       # 每次查 100 檔（實測上限 150，留餘裕）
-GAP = 1.0         # 一次只送一個請求，每次間隔 1 秒
+BATCH = 140       # 每次查 140 檔（實測上限 150；200 回空、300 網址太長）→ 全市場約 15 次
+GAP = 2.2         # 一次只送一個請求，送完至少隔 2.2 秒 → 任何 5 秒內最多 3 個請求
 # 教訓：
-#   2026-11-02 每輪打亂順序（避開證交所快取）＋同時 3 個＋每 30 秒 → 1.5 小時後 Render 被封鎖。
-#   2026-11-04 打亂順序＋一次一個＋每 60 秒 → 12 分鐘就被封鎖。
-#   之前好幾週用「固定順序」（吃證交所快取，資料約 1–2 分鐘更新一次）從沒被擋。
-# 所以：查詢順序固定不打亂，讓證交所用快取回應，負擔最輕；更新頻率就跟著證交所快取（約 1–2 分鐘）。
+#   2026-11-02 打亂順序＋同時 3 個＋每 30 秒 → 1.5 小時後 Render 被封鎖。
+#   2026-11-04 打亂順序＋一次一個（間隔 1 秒）＋每 60 秒 → 09:09 被封鎖。
+#   2026-11-06 固定順序＋一次一個（間隔 1 秒）＋每 60 秒 → 一樣 09:09 被封鎖。所以不是順序問題，是「太密」。
+#   證交所 MIS 常見的限制是「每 5 秒最多 3 個請求」，超過就封 IP；以前 664 檔只要 7 次請求才沒事。
+# 所以：每個請求之間至少 2.2 秒，順序固定。
+
+
+_GATE = threading.Lock()
+_GATE_LAST = [0.0]
+
+
+def mis_wait():
+    """所有打證交所 MIS 的請求（記錄器＋頁面查報價）都先排隊：兩個請求之間至少 GAP 秒。"""
+    with _GATE:
+        d = _GATE_LAST[0] + GAP - time.time()
+        if d > 0:
+            time.sleep(d)
+        _GATE_LAST[0] = time.time()
 
 
 def _fetch_part(part):
+    mis_wait()
     try:
         # Render 在海外，盤中每次要 5–15 秒；等待上限 20 秒
         r = session.get(MIS, params={"ex_ch": part, "json": 1, "delay": 0,
@@ -330,7 +346,7 @@ def _fetch_part(part):
 
 
 def fetch(ex_list):
-    """ex_list: ['tse_2330.tw', ...]；回傳有資料的 msgArray。每次查 100 檔、一次一個、順序固定（見上方教訓）。
+    """ex_list: ['tse_2330.tw', ...]；回傳有資料的 msgArray。每次查 140 檔、一次一個、間隔 2.2 秒、順序固定（見上方教訓）。
     連續 2 次失敗就停止這一輪（多半是被擋，硬打只會擋更久）。"""
     out, fails, ok = [], 0, 0
     for i in range(0, len(ex_list), BATCH):
@@ -343,7 +359,6 @@ def fetch(ex_list):
         else:
             fails, ok = 0, ok + 1
             out += rows
-        time.sleep(GAP)
     LAST_FETCH.update(ok=ok, fail=fails)
     if not out:
         session.cookies.clear()   # 整輪都沒資料：下一輪重新連線

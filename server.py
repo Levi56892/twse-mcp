@@ -11,6 +11,7 @@ import csv
 import io
 import os
 import re
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 import requests
@@ -151,7 +152,11 @@ def _pick(data, codes):
 
 # ---------- 盤中報價（上市、上櫃） ----------
 def _fetch_mis(codes):
-    # 查詢順序固定（不打亂）：讓證交所用快取回應，負擔最輕。打亂順序避開快取會被證交所封鎖（2026-11-02、11-04 兩次）
+    # 查詢順序固定（不打亂）
+    # 跟記錄器共用排隊閘門：證交所每 5 秒最多約 3 個請求，超過整台 Render 會被封（2026-11-06 證實與順序無關）
+    fr = sys.modules.get("flow_recorder")
+    if fr is not None and hasattr(fr, "mis_wait"):
+        fr.mis_wait()
     want = set(codes)
     ex_ch = "|".join(f"{m}_{c}.tw" for c in codes for m in ("tse", "otc"))
     if not _session.cookies:
