@@ -142,6 +142,39 @@ def _to_mis(s, c, key, today=None):
     }
 
 
+def _kcontract(key):
+    """K 棒用：t00 加權、o00 櫃買、TX 台指期近月連續合約。"""
+    if key == "TX":
+        a = api()
+        for f in (lambda: a.Contracts.Futures.TXF["TXFR1"], lambda: a.Contracts.Futures.TXF.TXFR1,
+                  lambda: a.Contracts.Futures["TXFR1"]):
+            try:
+                c = f()
+                if c is not None:
+                    return c
+            except Exception:  # noqa: BLE001
+                pass
+        return None
+    return _contract(key)
+
+
+def kbars(key, start, end):
+    """1 分 K：key＝t00／o00／TX，start、end＝'YYYY-MM-DD'。
+    回傳 [(台灣時間 datetime（該分鐘結束時間）, 開, 高, 低, 收, 量, 金額)]。"""
+    c = _kcontract(key)
+    if c is None:
+        raise RuntimeError(f"永豐找不到 {key}")
+    _wait()
+    kb = api().kbars(c, start=start, end=end)
+    out = []
+    amt = list(getattr(kb, "Amount", None) or [])
+    for i, t in enumerate(kb.ts):
+        dt = datetime.fromtimestamp(t / 1e9, tz=timezone.utc).replace(tzinfo=None)   # 台灣時間
+        out.append((dt, kb.Open[i], kb.High[i], kb.Low[i], kb.Close[i],
+                    kb.Volume[i] if i < len(kb.Volume) else 0, amt[i] if i < len(amt) else 0))
+    return out
+
+
 def fetch(ex_list):
     """ex_list：['tse_2330.tw', 'otc_o00.tw', ...]（跟 MIS 一樣的寫法）→ MIS 格式的 rows；整批失敗回傳 None。"""
     keys = [e.split("_", 1)[1].rsplit(".", 1)[0] for e in ex_list]
