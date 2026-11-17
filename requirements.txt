@@ -1,3 +1,4 @@
 mcp>=1.9,<2
 requests>=2.32
 tzdata
+shioaji>=1.7

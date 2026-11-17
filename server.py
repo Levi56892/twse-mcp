@@ -152,6 +152,15 @@ def _pick(data, codes):
 
 # ---------- 盤中報價（上市、上櫃） ----------
 def _fetch_mis(codes):
+    # 有永豐金金鑰：改用永豐快照（Render 已被證交所 MIS 長期封鎖）
+    try:
+        import sj_source
+        if sj_source.ENABLED:
+            rows, ok, _ = sj_source.fetch([f"tse_{c}.tw" for c in codes])
+            if ok:
+                return [m for m in rows if m.get("c") in set(codes)]
+    except Exception as e:  # noqa: BLE001
+        print("永豐報價失敗，改用證交所：", type(e).__name__, e, flush=True)
     # 查詢順序固定（不打亂）
     # 跟記錄器共用排隊閘門：證交所每 5 秒最多約 3 個請求，超過整台 Render 會被封（2026-11-06 證實與順序無關）
     fr = sys.modules.get("flow_recorder")

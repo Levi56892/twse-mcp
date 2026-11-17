@@ -345,9 +345,27 @@ def _fetch_part(part):
         return None
 
 
+try:
+    import sj_source   # 永豐金 API（有 SJ_API_KEY／SJ_SECRET_KEY 才啟用）
+    SJ = sj_source.ENABLED
+except Exception:  # noqa: BLE001
+    sj_source, SJ = None, False
+
+
 def fetch(ex_list):
-    """ex_list: ['tse_2330.tw', ...]；回傳有資料的 msgArray。每次查 140 檔、一次一個、間隔 2.2 秒、順序固定（見上方教訓）。
+    """ex_list: ['tse_2330.tw', ...]；回傳有資料的 msgArray。
+    有永豐金金鑰：用永豐快照（全市場約 5 秒）；沒有：證交所 MIS，每次查 140 檔、一次一個、間隔 2.2 秒、順序固定（見上方教訓）。
     連續 2 次失敗就停止這一輪（多半是被擋，硬打只會擋更久）。"""
+    if SJ:
+        try:
+            out, ok, fails = sj_source.fetch(ex_list)
+            LAST_FETCH.update(ok=ok, fail=fails)
+            return out
+        except Exception as e:  # noqa: BLE001
+            log("永豐快照錯誤", type(e).__name__, str(e)[:150])
+            sj_source.reset()
+            LAST_FETCH.update(ok=0, fail=1)
+            return []
     out, fails, ok = [], 0, 0
     for i in range(0, len(ex_list), BATCH):
         rows = _fetch_part("|".join(ex_list[i:i + BATCH]))
@@ -564,6 +582,7 @@ class Recorder:
             "last_trade_min": None if self.last_t is None else round(self.last_t - START, 2),
             "covered": self.covered,
             "writer": WRITER,
+            "feed": "sinopac" if SJ else "twse_mis",
             "universe": len(CODES) + len(EXTRA),
             "seeded": self.seeded,
             "method": "bidask",
@@ -714,6 +733,7 @@ def main():
     # 08:57:30 開始抓：全市場一輪約 15–20 秒（證交所慢的時候會更久），9:00 開盤前每檔都先看過一次（成交量 0），開盤那筆集合競價才能照開高／開低直接算
     while now_min() < START - 2.5:
         time.sleep(5)
+    log("報價來源：", "永豐金 API（快照）" if SJ else "證交所 MIS")
     rec.resolve_markets()
     if not rec.ex:
         log("抓不到任何報價，結束")
@@ -726,7 +746,8 @@ def main():
         except Exception as e:  # noqa: BLE001
             log("計算錯誤", type(e).__name__, e)
         # 09:10 還沒有任何成交 → 休市日（盤中重啟接續今天紀錄時不判斷，抓不到就繼續重試）
-        if now_min() > START + 10 and not rec.open_today and not rec.resumed:
+        # 只有「連得上、但拿到的報價都不是今天」才算休市；連不上（被擋）不算，繼續照煞車規則重試
+        if now_min() > START + 10 and not rec.open_today and not rec.resumed and LAST_FETCH["ok"] > 0:
             log("09:10 仍無成交，判斷為休市，結束")
             return
         took = time.time() - t0
@@ -741,11 +762,17 @@ def main():
         if time.time() - last_push >= PUSH_SEC and rec.hist:
             pusher.push(rec.payload())
             last_push = time.time()
-            log(f"已存檔 m={rec.hist[-1]['m']} 這輪 {took:.1f} 秒拿到 {rec.covered} 檔 全市場 {sum(rec.nets)/1e8:+.2f} 億")
+            extra = ""
+            if SJ:
+                used, lim = sj_source.usage_mb()
+                extra = f" 永豐流量 {used}/{lim} MB"
+            log(f"已存檔 m={rec.hist[-1]['m']} 這輪 {took:.1f} 秒拿到 {rec.covered} 檔 全市場 {sum(rec.nets)/1e8:+.2f} 億{extra}")
         time.sleep(max(1, POLL_SEC - (time.time() - t0)))   # 每 60 秒一輪
     rec.step()
     pusher.push(rec.payload())
     log("收盤，完成")
+    if SJ:
+        sj_source.reset()   # 收盤登出，釋放連線
 
 
 if __name__ == "__main__":
