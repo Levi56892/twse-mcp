@@ -12,6 +12,7 @@ import io
 import os
 import re
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 import requests
@@ -1102,18 +1103,20 @@ def _yahoo_bars(ysym, rng, interval):
     return out
 
 
-def _sj_bars(key, start, step, use_amount):
+def _sj_bars(key, start, step, use_amount, budget=25):
     """永豐金 1 分 K → 日 K（step=0）或 N 分 K。按月分段查、分段快取（過去的月份快取 1 天，當月 60 秒）。
     回傳 [[日期 或 'YYYY-MM-DD HH:MM', 開, 高, 低, 收, 量]]；量：指數用成交金額（億），台指期用口數。"""
     import sj_source
     today = datetime.now(TW_TZ).date()
     d = start.replace(day=1)
-    out = []
+    ranges = []
     while d <= today:
         nxt = (d.replace(day=28) + timedelta(days=4)).replace(day=1)
-        a, b = max(d, start), min(nxt - timedelta(days=1), today)
+        ranges.append((max(d, start), min(nxt - timedelta(days=1), today)))
+        d = nxt
 
-        def go(a=a, b=b):
+    def month(a, b):
+        def go():
             agg = {}
             rows = sj_source.kbars(key, a.isoformat(), b.isoformat())
             # 時間標的是該分鐘的「開始」還是「結束」：開盤那一分鐘（09:00，台指期 08:45／15:00）有出現就是「開始」
@@ -1141,9 +1144,45 @@ def _sj_bars(key, start, step, use_amount):
                 if bar[5] is not None:
                     bar[5] = round(bar[5], 2)
             return [agg[k] for k in sorted(agg)]
-        out += _cached(f"sjk:{key}:{step}:{a}:{b}", 60 if b >= today else 86400, go)
-        d = nxt
-    return out
+        return _cached(f"sjk:{key}:{step}:{a}:{b}", 60 if b >= today else 7 * 86400, go)
+
+    def cached(a, b):
+        hit = _cache.get(f"sjk:{key}:{step}:{a}:{b}")
+        return hit and time.time() - hit[0] < (60 if b >= today else 7 * 86400)
+
+    # 從最近的月份往回抓；第一次要抓很多個月時，最多花 budget 秒，剩下的交給背景慢慢補（下次打開就完整）
+    parts, t0, left = {}, time.time(), []
+    for a, b in reversed(ranges):
+        if cached(a, b) or time.time() - t0 < budget:
+            try:
+                parts[a] = month(a, b)
+            except Exception as e:  # noqa: BLE001
+                _kdbg(f"sj {key} {a}: {type(e).__name__} {e}")
+        else:
+            left.append((a, b))
+    if left:
+        tag = f"{key}:{step}"
+        with _SJ_FILL_LOCK:
+            busy = tag in _SJ_FILLING
+            _SJ_FILLING.add(tag)
+        if not busy:
+            def fill():
+                try:
+                    for a, b in left:
+                        try:
+                            month(a, b)
+                        except Exception as e:  # noqa: BLE001
+                            print("背景補 K 線失敗", tag, a, type(e).__name__, e, flush=True)
+                finally:
+                    with _SJ_FILL_LOCK:
+                        _SJ_FILLING.discard(tag)
+            threading.Thread(target=fill, name=f"kfill-{tag}", daemon=True).start()
+        _kdbg(f"還有 {len(left)} 個月在背景補")
+    return [bar for a, _ in ranges if a in parts for bar in parts[a]]
+
+
+_SJ_FILL_LOCK = threading.Lock()
+_SJ_FILLING = set()
 
 
 def _sj_ok():
@@ -1170,13 +1209,15 @@ def get_kline(symbol: str = "TAIEX", period: str = "day", months: int = 6, date:
                 return {"symbol": sym, "period": period, "bars": [], "error": "30 分 K 需要永豐金 API"}
             start = datetime.now(TW_TZ).date() - timedelta(days=max(3, min(int(days or 30), 90)))
             b = _sj_bars(key, start, int(period[:-1]), sym != "TX")
-            return {"symbol": sym, "period": period, "unit": "口" if sym == "TX" else "億元", "source": "sinopac", "bars": b}
+            return {"symbol": sym, "period": period, "unit": "口" if sym == "TX" else "億元", "source": "sinopac", "bars": b,
+                    "partial": f"{key}:{int(period[:-1])}" in _SJ_FILLING}
         if period == "day" and sym == "TPEX" and _sj_ok():
             try:
                 start = (datetime.now(TW_TZ) - timedelta(days=31 * months)).date()
                 b = _sj_bars("o00", start, 0, True)
                 if len(b) >= 5:
-                    return {"symbol": sym, "period": "day", "unit": "億元", "source": "sinopac", "bars": b}
+                    return {"symbol": sym, "period": "day", "unit": "億元", "source": "sinopac", "bars": b,
+                            "partial": "o00:0" in _SJ_FILLING}
             except Exception as e:  # noqa: BLE001
                 _kdbg(f"sj tpex day: {type(e).__name__} {e}")
         if period == "minute":
