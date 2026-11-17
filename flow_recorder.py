@@ -501,6 +501,18 @@ class Recorder:
             st = self.st.get(code)
             if st is None:
                 # 第一次看到：若已有成交，用 CLV 估算開啟前的部分（接續舊紀錄時不估，舊紀錄已含）
+                if v > 0 and z and now_min() <= START + 3 and not (self.resumed and code in self.snet):
+                    # 開盤 3 分鐘內第一次看到（永豐快照開盤前停在前一天，所以第一眼就已含開盤集合競價）：
+                    # 跟 MIS 一樣照開高（高於昨收）算買、開低算賣、平盤不計，不用 CLV 估算
+                    y0 = num(m.get("y"))
+                    d = lock or (((z > y0) - (z < y0)) if y0 else 0)
+                    amt = v * 1000 * z
+                    if si is not None:
+                        self.nets[si] += d * amt
+                    self.snet[code] = self.snet.get(code, 0.0) + d * amt
+                    self.samt[code] = amt
+                    self.st[code] = {"v": v, "p": z, "a": a1, "b": b1, "dir": d or 1}
+                    continue
                 if v > 0 and not (self.resumed and code in self.snet):
                     hi, lo = num(m.get("h")), num(m.get("l"))
                     p = z or ((hi + lo) / 2 if hi and lo else None) or num(m.get("y")) or 0
