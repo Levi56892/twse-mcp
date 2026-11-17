@@ -9,6 +9,7 @@
 """
 import csv
 import io
+import json
 import os
 import re
 import sys
@@ -1185,6 +1186,175 @@ _SJ_FILL_LOCK = threading.Lock()
 _SJ_FILLING = set()
 
 
+# ---------- 指數日 K 永久保存（GitHub kline 分支）：永豐查一個月 1 分 K 要將近 1 分鐘，抓過的就存起來 ----------
+_KSTORE = {}            # key -> {"bars": {日期: bar}, "from": 最早已查日, "thru": 最晚已查日, "sha": ...}
+_KSTORE_LOCK = threading.Lock()
+_KBRANCH = "kline"
+
+
+def _gh_h():
+    tok = os.environ.get("GH_WRITE_TOKEN", "")
+    h = {"Accept": "application/vnd.github+json"}
+    if tok:
+        h["Authorization"] = f"Bearer {tok}"
+    return h
+
+
+def _kstore_load(key):
+    with _KSTORE_LOCK:
+        if key in _KSTORE:
+            return _KSTORE[key]
+        st = {"bars": {}, "from": None, "thru": None, "sha": None}
+        try:
+            r = _session.get(f"https://api.github.com/repos/{FLOW_REPO}/contents/{key}_day.json",
+                             params={"ref": _KBRANCH}, headers=_gh_h(), timeout=20)
+            if r.status_code == 200:
+                import base64
+                js = r.json()
+                data = json.loads(base64.b64decode(js["content"]).decode("utf-8"))
+                st.update(bars={b[0]: b for b in data.get("bars", [])}, sha=js.get("sha"),
+                          **{"from": data.get("from"), "thru": data.get("thru")})
+        except Exception as e:  # noqa: BLE001
+            print("讀取 kline 失敗", key, type(e).__name__, e, flush=True)
+        _KSTORE[key] = st
+        return st
+
+
+def _kstore_save(key):
+    if not os.environ.get("GH_WRITE_TOKEN"):
+        return
+    import base64
+    st = _KSTORE[key]
+    body = {"message": f"指數日K {key} {st['from']}~{st['thru']}", "branch": _KBRANCH,
+            "content": base64.b64encode(json.dumps(
+                {"from": st["from"], "thru": st["thru"], "bars": [st["bars"][k] for k in sorted(st["bars"])]},
+                ensure_ascii=False, separators=(",", ":")).encode("utf-8")).decode()}
+    url = f"https://api.github.com/repos/{FLOW_REPO}/contents/{key}_day.json"
+    for _ in range(2):
+        if st["sha"]:
+            body["sha"] = st["sha"]
+        try:
+            r = _session.put(url, json=body, headers=_gh_h(), timeout=30)
+        except requests.RequestException as e:
+            print("存 kline 失敗", type(e).__name__, flush=True); return
+        if r.status_code in (200, 201):
+            st["sha"] = r.json().get("content", {}).get("sha"); return
+        if r.status_code == 404 and "Branch" in r.text:
+            try:   # 第一次：從 main 開一個 kline 分支
+                main = _session.get(f"https://api.github.com/repos/{FLOW_REPO}/git/ref/heads/main", headers=_gh_h(), timeout=20).json()
+                _session.post(f"https://api.github.com/repos/{FLOW_REPO}/git/refs", headers=_gh_h(), timeout=20,
+                              json={"ref": f"refs/heads/{_KBRANCH}", "sha": main["object"]["sha"]})
+            except Exception as e:  # noqa: BLE001
+                print("建立 kline 分支失敗", type(e).__name__, e, flush=True); return
+            continue
+        if r.status_code in (409, 422):   # sha 不對：重新讀一次
+            try:
+                g = _session.get(url, params={"ref": _KBRANCH}, headers=_gh_h(), timeout=20)
+                st["sha"] = g.json().get("sha") if g.status_code == 200 else None
+            except Exception:  # noqa: BLE001
+                st["sha"] = None
+            continue
+        print("存 kline 失敗", r.status_code, r.text[:150], flush=True); return
+
+
+def _sj_daily(key, months):
+    """指數日 K（含每日成交金額）：已存的直接用；缺的日子在背景向永豐補（新的先補，再往回補舊的），補完存回 GitHub。
+    今天那根每分鐘重抓。回傳 (bars, partial)。"""
+    st = _kstore_load(key)
+    today = datetime.now(TW_TZ).date()
+    yday = today - timedelta(days=1)
+    want_from = (datetime.now(TW_TZ) - timedelta(days=31 * months)).date()
+    iso = lambda d: d.isoformat()   # noqa: E731
+
+    def todo():
+        """還要補的區間（新的在前），每段最多一個月。"""
+        out = []
+        f = date_from(st["from"]); t = date_from(st["thru"])
+        if t is None:                       # 什麼都沒有：從昨天往回補
+            hi, lo_new = yday, None
+        else:
+            hi, lo_new = yday, t + timedelta(days=1)
+        if lo_new is not None and lo_new <= hi:
+            out.append((lo_new, hi))         # 上次之後到昨天
+        old_hi = (f - timedelta(days=1)) if f else yday
+        while old_hi >= want_from:
+            lo = max(want_from, old_hi.replace(day=1))
+            out.append((lo, old_hi))
+            old_hi = lo - timedelta(days=1)
+        return out
+
+    def fetch(a, b):
+        bars = _sj_bars_range(key, a, b)
+        with _KSTORE_LOCK:
+            for x in bars:
+                st["bars"][x[0]] = x
+            st["from"] = iso(min(a, date_from(st["from"]) or a))
+            st["thru"] = iso(max(b, date_from(st["thru"]) or b))
+
+    jobs = todo()
+    tag = f"{key}:0"
+    if jobs:
+        with _SJ_FILL_LOCK:
+            busy = tag in _SJ_FILLING
+            _SJ_FILLING.add(tag)
+        if not busy:
+            def fill():
+                try:
+                    n = 0
+                    for a, b in todo():
+                        try:
+                            fetch(a, b); n += 1
+                        except Exception as e:  # noqa: BLE001
+                            print("補日K失敗", key, a, b, type(e).__name__, e, flush=True)
+                            break
+                        if n % 3 == 0:
+                            _kstore_save(key)
+                    _kstore_save(key)
+                finally:
+                    with _SJ_FILL_LOCK:
+                        _SJ_FILLING.discard(tag)
+            threading.Thread(target=fill, name=f"kfill-{tag}", daemon=True).start()
+    # 今天（盤中每分鐘更新）
+    out = dict(st["bars"])
+    try:
+        for x in _cached(f"sjtoday:{key}:{today}", 60, lambda: _sj_bars_range(key, today, today)):
+            out[x[0]] = x
+    except Exception as e:  # noqa: BLE001
+        _kdbg(f"sj today {key}: {type(e).__name__} {e}")
+    bars = [out[k] for k in sorted(out) if k >= iso(want_from)]
+    return bars, tag in _SJ_FILLING
+
+
+def date_from(s):
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date() if s else None
+    except ValueError:
+        return None
+
+
+def _sj_bars_range(key, a, b):
+    """永豐 1 分 K（a～b 日）→ 日 K [[日期, 開, 高, 低, 收, 成交金額(億)]]。"""
+    import sj_source
+    agg = {}
+    for dt, o, h, l, c, v, amt in sj_source.kbars(key, a.isoformat(), b.isoformat()):
+        if not (o and h and l and c):
+            continue
+        k = f"{dt:%Y-%m-%d}"
+        q = amt / 1e8 if amt else None
+        bar = agg.get(k)
+        if bar is None:
+            agg[k] = [k, o, h, l, c, q]
+        else:
+            bar[2] = max(bar[2], h); bar[3] = min(bar[3], l); bar[4] = c
+            if q is not None:
+                bar[5] = (bar[5] or 0) + q
+    for bar in agg.values():
+        bar[1:5] = [round(x, 2) for x in bar[1:5]]
+        if bar[5] is not None:
+            bar[5] = round(bar[5], 2)
+    return [agg[k] for k in sorted(agg)]
+
+
 def _sj_ok():
     try:
         import sj_source
@@ -1211,15 +1381,15 @@ def get_kline(symbol: str = "TAIEX", period: str = "day", months: int = 6, date:
             b = _sj_bars(key, start, int(period[:-1]), sym != "TX")
             return {"symbol": sym, "period": period, "unit": "口" if sym == "TX" else "億元", "source": "sinopac", "bars": b,
                     "partial": f"{key}:{int(period[:-1])}" in _SJ_FILLING}
-        if period == "day" and sym == "TPEX" and _sj_ok():
+        # 加權、櫃買日 K：用永豐金 1 分 K 合成（含每日成交金額）；證交所／Yahoo 擋伺服器時才退回
+        if period == "day" and sym in ("TAIEX", "TPEX") and _sj_ok():
             try:
-                start = (datetime.now(TW_TZ) - timedelta(days=31 * months)).date()
-                b = _sj_bars("o00", start, 0, True)
-                if len(b) >= 5:
+                b, partial = _sj_daily(key, months)
+                if len(b) >= 5 or partial:
                     return {"symbol": sym, "period": "day", "unit": "億元", "source": "sinopac", "bars": b,
-                            "partial": "o00:0" in _SJ_FILLING}
+                            "partial": partial}
             except Exception as e:  # noqa: BLE001
-                _kdbg(f"sj tpex day: {type(e).__name__} {e}")
+                _kdbg(f"sj {sym} day: {type(e).__name__} {e}")
         if period == "minute":
             if sym not in ("TAIEX", "TPEX"):
                 return {"symbol": sym, "period": period, "bars": [], "error": "分 K 只支援 TAIEX、TPEX，台指期請用雲端記錄的走勢"}
