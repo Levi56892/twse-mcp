@@ -620,6 +620,16 @@ def get_holder_history(code: str) -> list[dict]:
 
 
 @mcp.tool()
+def get_margin_market(days: int = 250) -> dict:
+    """大盤融資維持率（上市、上櫃，皆扣除 ETF；每天收盤後由 GitHub Actions 的 margin_market.py 推估）。
+    days：最近幾個交易日（最多 500）。回傳 {"上市": rows, "上櫃": rows}，
+    rows 每列 [日期, 維持率(1.35＝135%), 融資市值(億), 推估融資金額(億), 融資餘額(張)]。"""
+    d = _store_json("margin_market.json", 1800)
+    n = max(1, min(int(days or 250), 500))
+    return {k: (v or [])[-n:] for k, v in d.items()} if d else {"上市": [], "上櫃": [], "error": "尚未產生資料"}
+
+
+@mcp.tool()
 def get_store_status() -> dict:
     """查看歷史資料庫的狀態：最後更新時間、還有多少交易日待回補。"""
     st = _store_json("status.json", 600)
@@ -679,6 +689,16 @@ def get_fund_flow() -> dict:
     if not data:
         return {"empty": True, "source": src}
     return {**data, "source": src}
+
+
+@mcp.tool()
+def get_index_series() -> dict:
+    """當天加權（t00）、櫃買（o00）盤中走勢（資金流記錄器每分鐘存的點，比 get_fund_flow 輕很多）。
+    回傳：date, updated, t00:[[距 09:00 分鐘, 指數]], o00:[[...]]。"""
+    data, src = _cached("flow", FLOW_TTL, _fetch_flow)
+    idx = (data or {}).get("idx") or {}
+    return {"date": (data or {}).get("date"), "updated": (data or {}).get("updated"),
+            "t00": idx.get("t00") or [], "o00": idx.get("o00") or [], "source": src}
 
 
 # ---------- 期貨（期交所 MIS，台指期等） ----------
