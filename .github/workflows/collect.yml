@@ -54,6 +54,12 @@ jobs:
           SCHEDULE: ${{ github.event.schedule }}
         run: python code/collector.py
 
+      - name: 推估大盤融資維持率
+        if: always() && github.event.inputs.mode != 'probe'
+        env:
+          DATA_DIR: data
+        run: python code/margin_market.py || echo "大盤融資維持率推估失敗（不影響其他資料）"
+
       - name: 存回 data 分支
         if: always() && github.event.inputs.mode != 'probe'
         run: |
