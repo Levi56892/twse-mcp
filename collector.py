@@ -29,7 +29,7 @@ T0 = time.time()
 MODE = (os.environ.get("MODE") or "").strip()
 SCHEDULE = (os.environ.get("SCHEDULE") or "").strip()
 if not MODE:
-    MODE = "daily" if SCHEDULE.startswith("30 13") else "backfill"
+    MODE = "daily" if SCHEDULE.startswith(("30 13", "0 15")) else "backfill"   # 21:30 與 23:00 補抓都是當天模式
 BUDGET = {"daily": 40, "backfill": 300, "probe": 10}.get(MODE, 60) * 60
 GAP = 2.0
 STOCK = re.compile(r"^[1-9]\d{3}$")
