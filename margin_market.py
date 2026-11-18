@@ -25,7 +25,9 @@ DATA = os.environ.get("DATA_DIR", "data")
 WARMUP_YEARS = 3          # 用前幾年資料把成本推估暖機
 KEEP_DAYS = 500           # 輸出最近幾個交易日
 RATIO = {"上市": 0.6, "上櫃": 0.6}
-ETF_WARMUP = 250          # ETF 成本暖機要多抓的交易日
+RANK_N = 30               # 個股排行各取幾檔
+RANK_MIN_LOAN = 5.0       # 維持率排行只看融資金額 5 億以上（太小的維持率雜訊大）
+ETF_WARMUP = 250         # ETF 成本暖機要多抓的交易日
 ETF_MIN_WARM = 120        # ETF 連續資料滿這麼多天後才輸出「含 ETF」
 ETF_BUDGET = float(os.environ.get("ETF_BUDGET_MIN", "25")) * 60   # 每次最多花幾秒回補 ETF
 
@@ -146,7 +148,9 @@ def fetch_etf(days):
         with open(os.path.join(root, f"{d}.json"), "w", encoding="utf-8") as fh:
             json.dump(out, fh, ensure_ascii=False, separators=(",", ":"))
         n += 1
-    print(f"ETF 本次補了 {n} 天，還缺 {len(miss) - n} 天")
+        if n % 20 == 0:
+            print(f"ETF 回補中：已補 {n} 天（到 {d}），已花 {(time.time() - t0) / 60:.1f} 分鐘", flush=True)
+    print(f"ETF 本次補了 {n} 天，還缺 {len(miss) - n} 天", flush=True)
 
 
 def main():
@@ -158,6 +162,7 @@ def main():
     y1 = date.today().year
     years = range(y1 - WARMUP_YEARS, y1 + 1)
     agg = {"上市": {}, "上櫃": {}}
+    last_stock = {}
     root = os.path.join(DATA, "daily")
     for code in sorted(os.listdir(root)):
         if not (len(code) == 4 and code.isdigit() and code[0] != "0"):
@@ -174,7 +179,19 @@ def main():
         rows.sort(key=lambda r: r["date"])
         r = RATIO[mkt]
         A = agg[mkt]
-        add_model(A, model(rows), r)
+        m = model(rows)
+        add_model(A, m, r)
+        # 個股最新一天（給排行用）
+        ds = sorted(m)
+        if ds:
+            bal, close, avg = m[ds[-1]]
+            if bal and avg:
+                back = lambda n: bal - m[ds[-1 - n]][0] if len(ds) > n else None  # noqa: E731
+                last_stock[code] = [ds[-1], code, (info.get(code) or {}).get("name") or code, mkt, close, int(bal),
+                                    back(1), back(5), round(avg, 2), round(close / (avg * r), 4),
+                                    round(bal * 1000 * avg * r / 1e8, 2),
+                                    round(close / m[ds[-2]][1] - 1, 5) if len(ds) > 1 and m[ds[-2]][1] else None,
+                                    [round(b * 1000 * a * r / 1e8, 2) if a else 0 for b, _, a in (m[x] for x in ds[-11:])]]
 
     # ---- ETF（含 ETF 版本用）：每天一個檔，抓過不重抓 ----
     days_all = sorted(set(agg["上市"]) | set(agg["上櫃"]))
@@ -221,10 +238,20 @@ def main():
             E = etf_agg[mkt]
             out[mkt + "含ETF"] = [row(d, [A[d][i] + E[d][i] for i in range(3)]) for d in days
                                  if d >= emit_from and d in E and A[d][1] > 0]
+    # 全市場個股排行（只算最新交易日有資料的股票）
+    # 每列 [日期, 代號, 名稱, 市場, 收盤, 融資餘額張, 日增減, 5日增減, 融資成本, 維持率, 融資金額億, 漲跌幅, 近11日融資金額億[]（算 10 日變化）]
+    latest = max((v[0] for v in last_stock.values()), default=None)
+    pool = [v for v in last_stock.values() if v[0] == latest]
+    out["排行金額"] = sorted(pool, key=lambda v: -v[10])[:RANK_N]
+    dl = lambda v: v[12][-1] - v[12][-2] if len(v[12]) > 1 else 0  # noqa: E731  融資金額日變動
+    half = RANK_N // 2   # 融資金額增加前 15 ＋ 減少前 15
+    out["排行金額變化"] = (sorted([v for v in pool if dl(v) > 0], key=lambda v: -dl(v))[:half]
+                       + sorted([v for v in pool if dl(v) < 0], key=dl)[:half])
+    out["排行維持率"] = sorted([v for v in pool if v[10] >= RANK_MIN_LOAN], key=lambda v: v[9])[:RANK_N]
     with open(os.path.join(DATA, "margin_market.json"), "w", encoding="utf-8") as fh:
         json.dump(out, fh, ensure_ascii=False, separators=(",", ":"))
     for mkt, rows in out.items():
-        if rows:
+        if rows and not mkt.startswith("排行"):
             print(f"{mkt} 融資維持率 {rows[-1][0]}：{rows[-1][1] * 100:.2f}%（融資金額 {rows[-1][3]:,.0f} 億）")
 
 
