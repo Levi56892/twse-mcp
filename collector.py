@@ -706,52 +706,165 @@ def backfill_holders():
     save_json("status.json", status)
 
 
-def backfill_revenue():
-    """月營收歷史：公開資訊觀測站的月營收彙總表（盡力而為，抓不到就略過）。"""
+MOPS = "https://mopsov.twse.com.tw"   # 11-19：舊的 mops.twse.com.tw/nas 已 404，彙總表搬到 mopsov
+
+
+def _n(v):
+    """num() 再把 pandas 的 NaN 當成空值。"""
+    v = num(v)
+    return None if v is None or v != v else v
+
+
+def _mops_rows(html):
+    """觀測站彙總表 HTML → 每家公司一個 {欄名: 值}；欄名用 f() 比對，所以表頭有空白、全形括號都沒關係。"""
+    import pandas as pd
+    out = []
     try:
-        import pandas as pd  # noqa: F401
+        tabs = pd.read_html(io.StringIO(html))
+    except ValueError:   # 整頁沒有表格（查無資料）
+        return out
+    for t in tabs:
+        if isinstance(t.columns, pd.MultiIndex):
+            t.columns = [c[-1] for c in t.columns]
+        cols = [str(c) for c in t.columns]
+        if not any(norm(c) == norm("公司代號") for c in cols):
+            continue
+        for vals in t.itertuples(index=False):
+            row = dict(zip(cols, vals))
+            c = str(f(row, "公司代號") or "").strip()
+            if STOCK.match(c):
+                row["_code"] = c
+                out.append(row)
+    return out
+
+
+def post(host, url, data, tries=3):
+    err = None
+    for i in range(tries):
+        with _locks[host]:
+            w = _last[host] + GAP + 1.5 - time.time()   # 觀測站比較會擋，間隔再拉長一點
+            if w > 0:
+                time.sleep(w)
+            _last[host] = time.time()
+            try:
+                r = S.post(url, data=data, timeout=60)
+                if r.status_code == 200 and "查詢過於頻繁" not in r.text and "因為安全性考量" not in r.text:
+                    return r
+                err = f"HTTP {r.status_code}" if r.status_code != 200 else "觀測站擋住（查詢過於頻繁）"
+            except requests.RequestException as e:
+                err = str(e)
+        time.sleep(15 * (i + 1))
+    raise RuntimeError(f"{url} {data}: {err}")
+
+
+def backfill_revenue(budget=25 * 60):
+    """月營收歷史：公開資訊觀測站的月營收彙總表，從最近的月份往回補到 2015-01。"""
+    try:
+        import pandas  # noqa: F401
     except ImportError:
         return
-    import pandas as pd
     done = status.setdefault("revenue_months", {})
+    stop_at = time.time() + budget
     today = datetime.now(TW).date()
-    y, m = START.year, START.month
-    while (y, m) < (today.year, today.month) and time_left() > 600:
+    y, m = (today.year, today.month - 1) if today.month > 1 else (today.year - 1, 12)
+    fails = 0
+    count = 0
+    while (y, m) >= (START.year, START.month) and time_left() > 600 and time.time() < stop_at:
         key = f"{y:04d}-{m:02d}"
         for mk, typ in (("上市", "sii"), ("上櫃", "otc")):
             k2 = f"{key}:{typ}"
             if done.get(k2):
                 continue
-            url = f"https://mops.twse.com.tw/nas/t21/{typ}/t21sc03_{y - 1911}_{m}_0.html"
+            url = f"{MOPS}/nas/t21/{typ}/t21sc03_{y - 1911}_{m}_0.html"
             try:
                 r = get("other", url, as_text=True, tries=2)
                 r.encoding = "big5"
                 rows = {}
-                for t in pd.read_html(io.StringIO(r.text)):
-                    if isinstance(t.columns, pd.MultiIndex):
-                        t.columns = [c[-1] for c in t.columns]
-                    t.columns = [str(c) for c in t.columns]
-                    if "公司代號" not in t.columns:
-                        continue
-                    for _, x in t.iterrows():
-                        c = str(x["公司代號"]).strip()
-                        if not STOCK.match(c):
-                            continue
-                        g = lambda *names: next((num(x[n]) for n in names if n in t.columns), None)  # noqa: E731
-                        rows[c] = {"month": key, "revenue_k": g("當月營收"), "last_month_k": g("上月營收"),
-                                   "last_year_k": g("去年當月營收"), "mom_pct": g("上月比較增減(%)"),
-                                   "yoy_pct": g("去年同月增減(%)"), "ytd_k": g("當月累計營收"),
-                                   "ytd_last_k": g("去年累計營收"), "ytd_yoy_pct": g("前期比較增減(%)")}
+                for x in _mops_rows(r.text):
+                    rows[x["_code"]] = {
+                        "month": key, "revenue_k": _n(f(x, "當月營收")), "last_month_k": _n(f(x, "上月營收")),
+                        "last_year_k": _n(f(x, "去年當月營收")), "mom_pct": _n(f(x, "上月比較增減(%)")),
+                        "yoy_pct": _n(f(x, "去年同月增減(%)")), "ytd_k": _n(f(x, "當月累計營收")),
+                        "ytd_last_k": _n(f(x, "去年累計營收")), "ytd_yoy_pct": _n(f(x, "前期比較增減(%)"))}
                 for c, row in rows.items():
                     merge_csv(f"revenue/{c}.csv", "month", REV_COLS, {key: row})
-                done[k2] = len(rows) or -1
+                if rows:
+                    done[k2] = len(rows)
+                fails = 0
+                count += 1
                 log(f"月營收歷史 {key} {mk}：{len(rows)} 檔")
             except Exception as e:  # noqa: BLE001
+                fails += 1
                 log(f"月營收歷史 {key} {mk} 失敗：{e}")
-                return   # 觀測站擋住時先停，下次再試
-        m += 1
-        if m == 13:
-            y, m = y + 1, 1
+                if fails >= 3:
+                    log("月營收歷史：連續失敗，先停，下次再試")
+                    save_json("status.json", status)
+                    return
+        if count and count % 20 == 0:
+            save_json("status.json", status)
+        m -= 1
+        if m == 0:
+            y, m = y - 1, 12
+    save_json("status.json", status)
+
+
+def backfill_financials(budget=25 * 60):
+    """季報歷史：觀測站「綜合損益彙總表」＋「資產負債彙總表」，從最近一季往回補到 2015Q1。
+    損益是當年度累計（Q4＝全年），跟 collect_financials() 的 OpenAPI 一致。"""
+    try:
+        import pandas  # noqa: F401
+    except ImportError:
+        return
+    done = status.setdefault("fin_quarters", {})
+    stop_at = time.time() + budget
+    today = datetime.now(TW).date()
+    y, q = today.year, (today.month - 1) // 3 + 1
+    fails = 0
+    while (y, q) >= (START.year, 1) and time_left() > 600 and time.time() < stop_at:
+        per = f"{y}Q{q}"
+        recent = (today - date(y, 3 * q, 1)).days < 200   # 近兩季可能還沒公布完，筆數少不算補完
+        for mk, typ in (("上市", "sii"), ("上櫃", "otc")):
+            k2 = f"{per}:{typ}"
+            if done.get(k2):
+                continue
+            form = {"encodeURIComponent": "1", "step": "1", "firstin": "1", "off": "1", "isQuery": "Y",
+                    "TYPEK": typ, "year": str(y - 1911), "season": f"{q:02d}"}
+            try:
+                inc = _mops_rows(post("other", f"{MOPS}/mops/web/ajax_t163sb04", form).text)
+                bal = _mops_rows(post("other", f"{MOPS}/mops/web/ajax_t163sb05", form).text)
+                rows = {}
+                for x in inc:
+                    rows[x["_code"]] = {
+                        "period": per,
+                        "revenue_k": _n(f(x, "營業收入", "收益", "淨收益", "收入", "利息淨收益")),
+                        "gross_profit_k": _n(f(x, "營業毛利（毛損）淨額", "營業毛利（毛損）")),
+                        "operating_income_k": _n(f(x, "營業利益（損失）", "營業利益")),
+                        "pretax_income_k": _n(f(x, "稅前淨利（淨損）", "繼續營業單位稅前淨利（淨損）", "繼續營業單位稅前損益")),
+                        "net_income_k": _n(f(x, "淨利（淨損）歸屬於母公司業主", "淨利（損）歸屬於母公司業主", "本期淨利（淨損）")),
+                        "eps": _n(f(x, "基本每股盈餘（元）", "基本每股盈餘", "每股盈餘"))}
+                for x in bal:
+                    rows.setdefault(x["_code"], {"period": per}).update({
+                        "total_assets_k": _n(f(x, "資產總計", "資產總額")),
+                        "total_liabilities_k": _n(f(x, "負債總計", "負債總額")),
+                        "equity_parent_k": _n(f(x, "歸屬於母公司業主之權益合計", "權益總計", "權益總額")),
+                        "book_value_per_share": _n(f(x, "每股參考淨值"))})
+                for c, row in rows.items():
+                    merge_csv(f"financials/{c}.csv", "period", FIN_COLS, {per: row})
+                if rows and not recent:
+                    done[k2] = len(rows)
+                fails = 0
+                log(f"季報歷史 {per} {mk}：損益 {len(inc)} 檔、資產負債 {len(bal)} 檔")
+            except Exception as e:  # noqa: BLE001
+                fails += 1
+                log(f"季報歷史 {per} {mk} 失敗：{e}")
+                if fails >= 3:
+                    log("季報歷史：連續失敗，先停，下次再試")
+                    save_json("status.json", status)
+                    return
+        save_json("status.json", status)
+        q -= 1
+        if q == 0:
+            y, q = y - 1, 4
 
 
 # ---------- 主程式 ----------
@@ -811,6 +924,8 @@ def main():
         if not os.path.exists(os.path.join(DATA, "holders")):
             collect_holders()
         backfill_holders()
+        backfill_revenue()       # 月營收、季報歷史資料量小，先補（以前排在股價後面常輪不到時間）
+        backfill_financials()
         count = 0
         for d in weekdays_back(today - timedelta(days=1), START):
             if time_left() < 900:
@@ -825,7 +940,6 @@ def main():
                 save_json("status.json", status)
                 log(f"已回補到 {d}")
         buf.flush()
-        backfill_revenue()
         if not os.path.exists(os.path.join(DATA, "revenue")):
             collect_revenue()
         if not os.path.exists(os.path.join(DATA, "financials")):
