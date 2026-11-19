@@ -314,7 +314,7 @@ def main():
 
     # ---- 用官方公布的市場融資金額（含 ETF）校正推估的融資金額 ----
     # 推估成本會隨行情偏離（2024 年約高 3%、2026 年高到 15%），融資市值則是準的；
-    # 所以每天算 k = 官方融資金額 ÷ 推估融資金額（含 ETF），含 ETF 與扣 ETF 的融資金額都乘上 k。
+    # 含 ETF：每天算 k = 官方融資金額 ÷ 推估融資金額（含 ETF），融資金額乘上 k（＝官方數字）。扣 ETF 維持原本推估（11-19 使用者決定）。
     off = fetch_official(sorted(days_all)[-KEEP_DAYS:])
     out = {"校正": []}   # 用 list，伺服器切片才不會出錯
     for i, (mkt, A) in enumerate(agg.items()):
@@ -325,7 +325,14 @@ def main():
         def adj(a, d, K=K):
             k = K.get(d)
             return [a[0], a[1] * k, a[2]] if k else a
-        out[mkt] = [row(d, adj(A[d], d)) for d in days]
+        # 扣 ETF：維持率照原本推估成本（使用者決定，貼近玩股網扣 ETF 表）；
+        # 融資金額＝官方融資金額 − ETF 推估融資金額（跟玩股網一樣，11/18 上市 4,714 億），沒有官方數字的日子用推估 × k
+        def ex_row(d, i=i, A=A, E=E, K=K):
+            a = A[d]
+            o = (off.get(d) or [None, None])[i]
+            loan = o - E[d][1] if o and d in E else a[1] * (K.get(d) or 1)
+            return [d, round(a[0] / a[1], 5), round(a[0] / 1e8, 2), round(loan / 1e8, 2), int(a[2])]
+        out[mkt] = [ex_row(d) for d in days]
         if E:
             out[mkt + "含ETF"] = [row(d, adj([A[d][j] + E[d][j] for j in range(3)], d)) for d in days if d in E]
         if ks:
