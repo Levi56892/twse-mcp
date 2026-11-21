@@ -1,0 +1,3 @@
+date,open,high,low,close,volume_lots,foreign_lots,trust_lots,dealer_lots,total_lots,margin_lots,short_lots,sbl_lots,foreign_hold_lots,foreign_hold_pct,margin_buy_lots,margin_sell_lots,margin_repay_lots
+2016-12-29,,,,,,,,,,,,,0,0,,,
+2016-12-30,44.8,45,41.15,41.95,3565,-210,0,60,-150,,,,466,0.62,,,

@@ -1,0 +1,7 @@
+date,open,high,low,close,volume_lots,foreign_lots,trust_lots,dealer_lots,total_lots,margin_lots,short_lots,sbl_lots,foreign_hold_lots,foreign_hold_pct,margin_buy_lots,margin_sell_lots,margin_repay_lots
+2020-12-24,,,,,,,,,,,,,0,0,,,
+2020-12-25,50,56.4,46.25,54.9,1195,,,,,,,,0,0,,,
+2020-12-28,55,55,51,52.3,428,,,,,,,,0,0,,,
+2020-12-29,51.8,59,50.1,58.6,708,,,,,,,,0,0,,,
+2020-12-30,58.6,65,58.6,61,600,,,,,,,,0,0,,,
+2020-12-31,60,60.5,58,60,198,,,,,,,,0,0,,,
