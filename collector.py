@@ -29,7 +29,7 @@ T0 = time.time()
 MODE = (os.environ.get("MODE") or "").strip()
 SCHEDULE = (os.environ.get("SCHEDULE") or "").strip()
 if not MODE:
-    MODE = "daily" if SCHEDULE.startswith(("30 13", "0 15")) else "backfill"   # 21:30 與 23:00 補抓都是當天模式
+    MODE = "daily" if SCHEDULE.startswith(("30 13", "0 15", "17 14", "43 16")) else "backfill"   # 21:30、22:17、23:00、00:43 都是當天模式
 BUDGET = {"daily": 40, "backfill": 300, "probe": 10}.get(MODE, 60) * 60
 GAP = 2.0
 STOCK = re.compile(r"^[1-9]\d{3}$")
@@ -921,6 +921,13 @@ def main():
         collect_financials()
         collect_holders()
     else:
+        # GitHub 有時會漏跑晚上的排程：回補模式也先把最近兩週還沒抓到的交易日補上（21:00 後含今天）
+        recent_end = today if datetime.now(TW).hour >= 21 else today - timedelta(days=1)
+        for d in weekdays_back(recent_end, today - timedelta(days=14)):
+            if not day_done(d.isoformat()):
+                log(f"先補最近漏抓的 {d}")
+                collect_day(d, buf)
+        buf.flush()
         if not os.path.exists(os.path.join(DATA, "holders")):
             collect_holders()
         backfill_holders()
