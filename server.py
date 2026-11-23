@@ -701,6 +701,94 @@ def get_index_series() -> dict:
             "t00": idx.get("t00") or [], "o00": idx.get("o00") or [], "source": src}
 
 
+# ---------- 個股漲跌貢獻點數（上市→加權、上櫃→櫃買） ----------
+SHARES_TTL = 12 * 3600
+
+
+def _shares_map():
+    """已發行普通股數：證交所／櫃買中心公司基本資料（每天更新一次就夠）。"""
+    def go():
+        out = {}
+        for base, path, mkt in ((TWSE, "/opendata/t187ap03_L", "上市"), (TPEX, "/mopsfin_t187ap03_O", "上櫃")):
+            r = _session.get(base + path, timeout=40)
+            r.raise_for_status()
+            for d in r.json():
+                c = _code(d)
+                n = _num(_f(d, "已發行普通股數或TDR原股發行股數", "IssueShares") or
+                         _ftok(d, ("已發行", "股數"), ("Issue", "Shares")))
+                if c and n:
+                    out[c] = (mkt, n)
+        return out
+    return _cached("shares_issued", SHARES_TTL, go)
+
+
+def _prev_close_map(flow_date):
+    """昨收：最新一份盤後收盤行情；若那份已是今天（收盤後更新了）就用 收盤−漲跌 回推。"""
+    out = {}
+    for base, path, ck in ((TWSE, "/exchangeReport/STOCK_DAY_ALL", "ClosingPrice"), (TPEX, TPEX_CLOSE, "Close")):
+        for d in _fetch_json(base, path):
+            c = _code(d)
+            close, chg = _num(_f(d, ck)), _num(_f(d, "Change"))
+            if not c or not close:
+                continue
+            ds = re.sub(r"\D", "",str(d.get("Date") or ""))
+            same_day = len(ds) == 7 and f"{int(ds[:3]) + 1911}-{ds[3:5]}-{ds[5:]}" == flow_date
+            out[c] = (close - chg) if (same_day and chg is not None) else close
+    return out
+
+
+@mcp.tool()
+def get_contribution() -> dict:
+    """盤中個股對大盤的漲跌貢獻點數。上市個股算對加權指數、上櫃個股算對櫃買指數，兩邊分開。
+    算法：點數 ≈ 指數昨收 × (個股昨日市值 ÷ 該市場普通股總市值) × 個股漲跌%（市值＝已發行股數×昨收）。
+    個股漲跌% 來自資金流記錄器（約 1 分鐘更新），指數用即時報價。
+    回傳：date, updated, markets:{上市:{index, prev, change, est_sum, total_cap(億), rows}, 上櫃:{...}}，
+    rows 每列 [代號, 名稱, 產業, 漲跌%, 貢獻點數, 權重%]，依點數由大到小。"""
+    flow, _ = _cached("flow", FLOW_TTL, _fetch_flow)
+    if not flow or not flow.get("stocks"):
+        return {"empty": True}
+    shares = _shares_map()
+    prev = _prev_close_map(flow.get("date"))
+    stock = re.compile(r"^[1-9]\d{3}$")
+    # 分母：該市場全部普通股的昨日市值（不只記錄器有看到的）
+    caps, tot = {}, {"上市": 0.0, "上櫃": 0.0}
+    for c, (mkt, n) in shares.items():
+        p = prev.get(c)
+        if stock.match(c) and p:
+            caps[c] = n * p
+            tot[mkt] += n * p
+    # 指數：即時報價（昨收、現價），抓不到就用記錄器的走勢最後一點
+    idx = {}
+    try:
+        for m in _cached("mis:o00,t00", QUOTE_TTL, lambda: _fetch_mis(["t00", "o00"])):
+            y = _num(m.get("y"))
+            z = _num(m.get("z")) or _first_level(m.get("b")) or _first_level(m.get("a"))
+            idx[m.get("c")] = (z, y)
+    except Exception as e:  # noqa: BLE001
+        print("貢獻點數：指數報價失敗", type(e).__name__, e, flush=True)
+    fidx = flow.get("idx") or {}
+    out = {}
+    for mkt, key in (("上市", "t00"), ("上櫃", "o00")):
+        z, y = idx.get(key, (None, None))
+        if not z and fidx.get(key):
+            z = fidx[key][-1][1]
+        rows, est = [], 0.0
+        T = tot[mkt]
+        for s in flow["stocks"]:
+            c, name, pct, smkt, ind = s[0], s[1], s[4], s[6], s[7] if len(s) > 7 else None
+            if smkt != mkt or pct is None or c not in caps or not T:
+                continue
+            w = caps[c] / T
+            pts = (y or 0) * w * pct / 100
+            est += pts
+            rows.append([c, name, ind, pct, round(pts, 3), round(w * 100, 4)])
+        rows.sort(key=lambda r: -r[4])
+        out[mkt] = {"index": z, "prev": y, "change": round(z - y, 2) if z and y else None,
+                    "est_sum": round(est, 2), "total_cap": round(T / 1e8), "n": len(rows), "rows": rows}
+    return {"date": flow.get("date"), "updated": flow.get("updated"),
+            "last_trade_min": flow.get("last_trade_min"), "markets": out}
+
+
 # ---------- 期貨（期交所 MIS，台指期等） ----------
 TAIFEX_MIS = "https://mis.taifex.com.tw/futures/api/getQuoteList"
 

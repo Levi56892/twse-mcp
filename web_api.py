@@ -35,7 +35,7 @@ ALLOWED = {
     "get_daily_close", "get_valuation", "get_emerging_quotes", "get_institutional", "get_monthly_revenue",
     "get_financials", "get_screener_universe", "get_stock_history", "get_revenue_history",
     "get_financials_history", "get_holder_history", "get_us_war_room", "get_us_quotes", "get_store_status",
-    "get_margin_market", "get_index_series",
+    "get_margin_market", "get_index_series", "get_contribution",
 }
 ORIGINS = [o.strip() for o in os.environ.get("WEB_ORIGINS", "").split(",") if o.strip()]
 
