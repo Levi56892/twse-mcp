@@ -22,7 +22,9 @@ import requests
 
 TW = timezone(timedelta(hours=8))
 MIS = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
-POLL_SEC = 60     # 每 60 秒一輪（30 秒＋同時 3 個請求會被證交所封鎖）
+POLL_SEC = 60     # 證交所 MIS：每 60 秒一輪（30 秒＋同時 3 個請求會被證交所封鎖）
+SJ_POLL_SEC = int(os.environ.get("SJ_POLL_SEC", "30"))   # 永豐金：每 30 秒一輪（11-23 使用者決定；一天約 220 MB，上限 500 MB）
+CURRENT = {}      # 最新一輪的 payload（server.py 直接從記憶體讀，不必繞 GitHub）
 FULL = os.environ.get("FULL_UNIVERSE", "1") == "1"   # 1＝全部上市櫃普通股；0＝各產業前 20 名
 TOP_N = int(os.environ.get("TOP_N", "20"))   # 每個產業取近 20 日成交金額前 N 名
 DATA_DIR = os.environ.get("DATA_DIR", "databr")  # data 分支（含每日成交量）
@@ -771,17 +773,25 @@ def main():
             time.sleep(wait)
             continue
         blocked = 0
-        if time.time() - last_push >= PUSH_SEC and rec.hist:
-            pusher.push(rec.payload())
+        pl = None
+        if rec.hist:
+            try:
+                pl = rec.payload()
+                CURRENT["payload"] = pl      # 在記錄器自己的執行緒裡做好，伺服器讀的是完整的一份
+            except Exception as e:  # noqa: BLE001
+                log("整理資料失敗", type(e).__name__, e)
+        if time.time() - last_push >= PUSH_SEC and pl:
+            pusher.push(pl)
             last_push = time.time()
             extra = ""
             if SJ:
                 used, lim = sj_source.usage_mb()
                 extra = f" 永豐流量 {used}/{lim} MB"
             log(f"已存檔 m={rec.hist[-1]['m']} 這輪 {took:.1f} 秒拿到 {rec.covered} 檔 全市場 {sum(rec.nets)/1e8:+.2f} 億{extra}")
-        time.sleep(max(1, POLL_SEC - (time.time() - t0)))   # 每 60 秒一輪
+        time.sleep(max(1, (SJ_POLL_SEC if SJ else POLL_SEC) - (time.time() - t0)))   # 永豐 30 秒、證交所 60 秒一輪
     rec.step()
-    pusher.push(rec.payload())
+    CURRENT["payload"] = rec.payload()
+    pusher.push(CURRENT["payload"])
     log("收盤，完成")
     if SJ:
         sj_source.reset()   # 收盤登出，釋放連線

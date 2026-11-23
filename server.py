@@ -678,14 +678,24 @@ def _fetch_flow():
     return r.json(), "raw"
 
 
+def _flow_data():
+    """盤中資金流：記錄器就跑在這台伺服器上時，直接讀它記憶體裡最新一輪的結果（每 30 秒更新）；
+    沒有（記錄器沒在這裡跑、伺服器剛重啟）才去 GitHub 讀 today.json。"""
+    fr = sys.modules.get("flow_recorder")
+    pl = (getattr(fr, "CURRENT", None) or {}).get("payload") if fr is not None else None
+    if pl and pl.get("date") == datetime.now(TW_TZ).strftime("%Y-%m-%d"):
+        return pl, "memory"
+    return _cached("flow", FLOW_TTL, _fetch_flow)
+
+
 @mcp.tool()
 def get_fund_flow() -> dict:
-    """盤中各產業主動買賣淨額（外盤−內盤金額，單位億元），由 GitHub Actions 在交易日 09:00–13:30 每 15 秒計算、每分鐘存檔。
+    """盤中各產業主動買賣淨額（外盤−內盤金額，單位億元），由伺服器上的記錄器在交易日 09:00–13:30 每 30 秒計算（盤中直接讀記憶體，否則讀 GitHub 存檔）。
     回傳：date, updated(最後存檔時間), last_trade_min(距 09:00 的分鐘數), covered(涵蓋檔數),
     seeded(是否有開盤後才啟動而用 CLV 估算的部分), sectors:[{name,g}],
     intensity:[最近一次各產業成交金額], hist:[{m:距 09:00 分鐘, n:[各產業累計淨額，順序同 sectors]}], source。
     只保留當天；不是交易日或還沒開始記錄時，date 會是之前的日期或回傳 empty=true。"""
-    data, src = _cached("flow", FLOW_TTL, _fetch_flow)
+    data, src = _flow_data()
     if not data:
         return {"empty": True, "source": src}
     return {**data, "source": src}
@@ -695,7 +705,7 @@ def get_fund_flow() -> dict:
 def get_index_series() -> dict:
     """當天加權（t00）、櫃買（o00）盤中走勢（資金流記錄器每分鐘存的點，比 get_fund_flow 輕很多）。
     回傳：date, updated, t00:[[距 09:00 分鐘, 指數]], o00:[[...]]。"""
-    data, src = _cached("flow", FLOW_TTL, _fetch_flow)
+    data, src = _flow_data()
     idx = (data or {}).get("idx") or {}
     return {"date": (data or {}).get("date"), "updated": (data or {}).get("updated"),
             "t00": idx.get("t00") or [], "o00": idx.get("o00") or [], "source": src}
@@ -741,10 +751,10 @@ def _prev_close_map(flow_date):
 def get_contribution() -> dict:
     """盤中個股對大盤的漲跌貢獻點數。上市個股算對加權指數、上櫃個股算對櫃買指數，兩邊分開。
     算法：點數 ≈ 指數昨收 × (個股昨日市值 ÷ 該市場普通股總市值) × 個股漲跌%（市值＝已發行股數×昨收）。
-    個股漲跌% 來自資金流記錄器（約 1 分鐘更新），指數用即時報價。
+    個股漲跌% 來自資金流記錄器（約 30 秒更新），指數用即時報價。
     回傳：date, updated, markets:{上市:{index, prev, change, est_sum, total_cap(億), rows}, 上櫃:{...}}，
     rows 每列 [代號, 名稱, 產業, 漲跌%, 貢獻點數, 權重%]，依點數由大到小。"""
-    flow, _ = _cached("flow", FLOW_TTL, _fetch_flow)
+    flow, _ = _flow_data()
     if not flow or not flow.get("stocks"):
         return {"empty": True}
     shares = _shares_map()
