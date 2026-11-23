@@ -679,7 +679,7 @@ def _fetch_flow():
 
 
 def _flow_data():
-    """盤中資金流：記錄器就跑在這台伺服器上時，直接讀它記憶體裡最新一輪的結果（每 30 秒更新）；
+    """盤中資金流：記錄器就跑在這台伺服器上時，直接讀它記憶體裡最新一輪的結果（每 60 秒更新）；
     沒有（記錄器沒在這裡跑、伺服器剛重啟）才去 GitHub 讀 today.json。"""
     fr = sys.modules.get("flow_recorder")
     pl = (getattr(fr, "CURRENT", None) or {}).get("payload") if fr is not None else None
@@ -690,7 +690,7 @@ def _flow_data():
 
 @mcp.tool()
 def get_fund_flow() -> dict:
-    """盤中各產業主動買賣淨額（外盤−內盤金額，單位億元），由伺服器上的記錄器在交易日 09:00–13:30 每 30 秒計算（盤中直接讀記憶體，否則讀 GitHub 存檔）。
+    """盤中各產業主動買賣淨額（外盤−內盤金額，單位億元），由伺服器上的記錄器在交易日 09:00–13:30 每 60 秒計算（盤中直接讀記憶體，否則讀 GitHub 存檔）。
     回傳：date, updated(最後存檔時間), last_trade_min(距 09:00 的分鐘數), covered(涵蓋檔數),
     seeded(是否有開盤後才啟動而用 CLV 估算的部分), sectors:[{name,g}],
     intensity:[最近一次各產業成交金額], hist:[{m:距 09:00 分鐘, n:[各產業累計淨額，順序同 sectors]}], source。
@@ -751,7 +751,7 @@ def _prev_close_map(flow_date):
 def get_contribution() -> dict:
     """盤中個股對大盤的漲跌貢獻點數。上市個股算對加權指數、上櫃個股算對櫃買指數，兩邊分開。
     算法：點數 ≈ 指數昨收 × (個股昨日市值 ÷ 該市場普通股總市值) × 個股漲跌%（市值＝已發行股數×昨收）。
-    個股漲跌% 來自資金流記錄器（約 30 秒更新），指數用即時報價。
+    個股漲跌% 來自資金流記錄器（約 1 分鐘更新），指數用即時報價。
     回傳：date, updated, markets:{上市:{index, prev, change, est_sum, total_cap(億), rows}, 上櫃:{...}}，
     rows 每列 [代號, 名稱, 產業, 漲跌%, 貢獻點數, 權重%]，依點數由大到小。"""
     flow, _ = _flow_data()

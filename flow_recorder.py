@@ -23,7 +23,7 @@ import requests
 TW = timezone(timedelta(hours=8))
 MIS = "https://mis.twse.com.tw/stock/api/getStockInfo.jsp"
 POLL_SEC = 60     # 證交所 MIS：每 60 秒一輪（30 秒＋同時 3 個請求會被證交所封鎖）
-SJ_POLL_SEC = int(os.environ.get("SJ_POLL_SEC", "30"))   # 永豐金：每 30 秒一輪（11-23 使用者決定；一天約 220 MB，上限 500 MB）
+SJ_POLL_SEC = int(os.environ.get("SJ_POLL_SEC", "60"))   # 永豐金：每 60 秒一輪（11-23 試過 30 秒，每輪約 0.8 MB、全天約 450 MB 太接近 500 MB 上限，使用者決定改回 60 秒）
 CURRENT = {}      # 最新一輪的 payload（server.py 直接從記憶體讀，不必繞 GitHub）
 FULL = os.environ.get("FULL_UNIVERSE", "1") == "1"   # 1＝全部上市櫃普通股；0＝各產業前 20 名
 TOP_N = int(os.environ.get("TOP_N", "20"))   # 每個產業取近 20 日成交金額前 N 名
@@ -719,6 +719,34 @@ def other_writer_active():
         return False
 
 
+PACE = {"used": None, "per": None, "iv": None}
+
+
+def sj_pace(base):
+    """永豐流量保護：量每一輪實際用掉多少 MB（含網頁查報價），照「剩下的額度 ÷ 到收盤還要幾輪」放慢間隔，
+    保證收盤前用量不超過上限的 90%；額度夠就維持 base（30 秒）。回傳 (間隔秒數, 給紀錄用的文字)。"""
+    used, lim = sj_source.usage_mb()
+    if used is None or not lim:
+        return base, ""
+    if PACE["used"] is not None and used >= PACE["used"]:
+        d = used - PACE["used"]
+        PACE["per"] = d if PACE["per"] is None else PACE["per"] * 0.7 + d * 0.3   # 平滑一下，避免單輪忽高忽低
+    PACE["used"] = used
+    iv = base
+    budget = lim * 0.9 - used
+    remain = max(60.0, (END - now_min()) * 60)
+    if budget <= 0:
+        iv = 300
+    elif PACE["per"]:
+        # 每輪用量 per（MB）× 到收盤的輪數（remain ÷ 間隔）≦ 剩下的額度 → 間隔 ≧ per × remain ÷ budget
+        iv = min(300, max(base, PACE["per"] * remain / budget))
+    iv = round(max(base, iv))
+    if PACE["iv"] is not None and abs(iv - PACE["iv"]) >= 5:
+        log(f"永豐流量 {used}/{lim} MB，間隔調整為 {iv} 秒")
+    PACE["iv"] = iv
+    return iv, f" 永豐流量 {used}/{lim} MB 間隔 {iv} 秒"
+
+
 def main():
     if datetime.now(TW).weekday() >= 5:
         log("週末，不記錄")
@@ -780,15 +808,15 @@ def main():
                 CURRENT["payload"] = pl      # 在記錄器自己的執行緒裡做好，伺服器讀的是完整的一份
             except Exception as e:  # noqa: BLE001
                 log("整理資料失敗", type(e).__name__, e)
+        interval = SJ_POLL_SEC if SJ else POLL_SEC   # 永豐、證交所都是 60 秒一輪
+        extra = ""
+        if SJ:
+            interval, extra = sj_pace(interval)
         if time.time() - last_push >= PUSH_SEC and pl:
             pusher.push(pl)
             last_push = time.time()
-            extra = ""
-            if SJ:
-                used, lim = sj_source.usage_mb()
-                extra = f" 永豐流量 {used}/{lim} MB"
             log(f"已存檔 m={rec.hist[-1]['m']} 這輪 {took:.1f} 秒拿到 {rec.covered} 檔 全市場 {sum(rec.nets)/1e8:+.2f} 億{extra}")
-        time.sleep(max(1, (SJ_POLL_SEC if SJ else POLL_SEC) - (time.time() - t0)))   # 永豐 30 秒、證交所 60 秒一輪
+        time.sleep(max(1, interval - (time.time() - t0)))
     rec.step()
     CURRENT["payload"] = rec.payload()
     pusher.push(CURRENT["payload"])
